@@ -20,7 +20,16 @@ MODELS=(
 
 [ -x "$LLAMA" ] || { echo "[err] llama-server 없음: $LLAMA"; exit 1; }
 
-_stop() { pkill -f "llama-serv[e]r.*:$PORT" 2>/dev/null; pkill -f "port $PORT.*llama-serv[e]r" 2>/dev/null; sleep 2; }
+_stop() {
+  # kill whatever holds $PORT and wait until it is actually released
+  local i pids p
+  for i in $(seq 1 12); do
+    pids=$(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+    [ -z "$pids" ] && { sleep 1; return 0; }
+    for p in $pids; do kill "$p" 2>/dev/null; done
+    sleep 1
+  done
+}
 trap _stop EXIT
 
 run_one() {
@@ -43,9 +52,12 @@ run_one() {
         -t 8 --host "$HOST" --port "$PORT" --jinja \
         >"$ROOT/logs/mistral-serve-$alias.log" 2>&1 &
     local spid=$!
-    for i in $(seq 1 60); do
-      kill -0 "$spid" 2>/dev/null || break   # 프로세스 죽음(OOM 등) → 다음 NGL
-      curl -s -m 2 "$BASE/v1/models" >/dev/null 2>&1 && { ok=1; break; }
+    for i in $(seq 1 90); do
+      kill -0 "$spid" 2>/dev/null || break   # 프로세스 죽음(OOM/포트 등) → 다음 NGL
+      # 모델이 실제로 로드돼 생성이 되는지로 readiness 판정 (/v1/models 는 로드 전에도 응답)
+      curl -s -m 5 "$BASE/v1/completions" -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$alias\",\"prompt\":\"hi\",\"max_tokens\":1}" 2>/dev/null \
+        | grep -q '"text"' && { ok=1; break; }
       sleep 2
     done
     [ "$ok" = 1 ] && { used_ngl="$NGL"; break; }
