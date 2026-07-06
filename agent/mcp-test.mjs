@@ -1,0 +1,12 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+const t = new StreamableHTTPClientTransport(new URL("http://localhost:8931/mcp"));
+const c = new Client({ name: "smoke", version: "1.0" });
+await c.connect(t);
+const tools = await c.listTools();
+console.log("[tools]", tools.tools.map(x => x.name).join(", "));
+console.log("[navigate] example.com ...");
+const r = await c.callTool({ name: "browser_navigate", arguments: { url: "https://example.com" } });
+const txt = (r.content || []).map(x => x.text || "").join("\n");
+console.log("[result]", txt.slice(0, 400));
+await c.close();

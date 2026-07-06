@@ -1,0 +1,15 @@
+[Unit]
+Description=Local LLM Open WebUI (docker, :3000)
+After=network-online.target llm-searxng.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust docker path (/snap/bin/docker vs /usr/bin/docker). Container must already exist.
+ExecStart=/snap/bin/docker start -a open-webui
+ExecStop=/snap/bin/docker stop -t 10 open-webui
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

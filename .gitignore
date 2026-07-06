@@ -1,0 +1,55 @@
+# ─── local-llm-toolkit .gitignore ───────────────────────────────────
+# The repo ships orchestration + docs only. Models, venvs, vendored
+# upstreams, logs, and machine-local state stay on disk but out of git.
+# NOTE: .gitignore does NOT support inline comments — keep patterns bare.
+
+# ── Models & weights (100s of GB — never commit) ────────────────────
+exl3/models/
+cpu/models/
+nvfp4-poc/models/
+**/models/
+*.gguf
+*.safetensors
+*.bin
+
+# ── Python venvs & build outputs ────────────────────────────────────
+.venv/
+**/.venv/
+llm-panel-rs/target/
+target/
+__pycache__/
+*.pyc
+
+# ── Vendored third-party upstreams (setup re-clones/builds these) ────
+exl3/tabbyAPI/
+agent/node_modules/
+
+# ── Logs & benchmark outputs (contain local paths) ──────────────────
+logs/
+*.log
+llama.log
+
+# ── Machine-local / generated configs (per-machine, not portable) ───
+config.env
+cpu/active.env
+exl3/tabbyAPI/config.yml
+
+# ── Secrets & runtime junk (NEVER commit) ───────────────────────────
+# agent/searxng/ is docker-owned and holds a real secret_key.
+# Commit agent/searxng.example.yml instead.
+agent/searxng/
+agent/chrome-profile/
+agent/browser-output/
+
+# ── Claude Code / OMC local tooling state ───────────────────────────
+.omc/
+**/.omc/
+.claude/
+
+# ── Editor / OS ─────────────────────────────────────────────────────
+.DS_Store
+*.swp
+*~
+
+# superseded by docs/how-to.md (English)
+HOW-TO-USE.md

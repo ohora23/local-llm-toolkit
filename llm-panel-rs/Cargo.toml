@@ -1,0 +1,23 @@
+[package]
+name = "llm-panel"
+version = "0.1.0"
+edition = "2021"
+description = "로컬 LLM 컨트롤 패널 (GPU EXL3 :5000 + CPU llama.cpp :5001) — fltk 네이티브, 저메모리"
+
+[[bin]]
+name = "llm-panel"
+path = "src/main.rs"
+
+[dependencies]
+# FLTK = 네이티브 위젯, GPU 컨텍스트 없음 → RSS 수 MB 수준(저메모리 footprint).
+fltk = "1.5"
+# json-status 파싱(가벼움).
+serde_json = "1"
+
+# 바이너리 크기·런타임 footprint 최소화
+[profile.release]
+opt-level = "z"      # 크기 최우선
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

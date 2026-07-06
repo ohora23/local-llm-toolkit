@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+# ───────────────────────────────────────────────────────────────────────
+#  llm — unified local LLM controller (GPU EXL3 :5000 + CPU llama.cpp :5001)
+# ───────────────────────────────────────────────────────────────────────
+#  Wraps the existing setup-*/start-*/bench-* scripts (does not delete them).
+#  Hermes (Xavier) is out of scope — only the two local endpoints.
+#
+#  Endpoints:
+#    gpu  EXL3/TabbyAPI :5000   Qwen3-Coder-30B full-GPU (~110 tok/s) — 영어/코딩
+#    cpu  llama.cpp     :5001   Qwen3-Coder-30B-A3B CPU-only (VRAM 0)
+#    hyb  ik_llama.cpp  :5002   gpt-oss-120B MXFP4 GPU+CPU hybrid (~30 tok/s) — 대형/범용
+#    ko   llama.cpp     :5003   Kanana-2-30B-A3B GGUF GPU (~9s 에이전트) — 한국어 네이티브
+#         ⚠ gpu·hyb·ko 는 VRAM 이 겹쳐 동시구동 불가 — 셋 중 택1. (gpu+cpu 만 공존)
+#
+#  Usage:
+#    llm up   [gpu|cpu|hyb|ko|both]   start server(s) (background + wait ready)
+#    llm down [gpu|cpu|hyb|ko|all]    stop server(s) (port-based, no self-kill)
+#    llm restart [gpu|cpu|hyb|ko|both]  down then up
+#    llm status                       engines/ports/models/VRAM/RAM/CPU at a glance
+#    llm models                       /v1/models of all endpoints
+#    llm ask "prompt" [--cpu|--gpu|--hyb|--ko]   one-shot query (default: whatever is up)
+#    llm chat [--cpu|--gpu|--hyb|--ko]   interactive chat REPL
+#    llm switch <a-moe|a-moe-q8|b-light>   switch CPU profile (restart if running)
+#    llm bench [gpu|cpu|hyb]          speed benchmark
+#    llm logs [gpu|cpu|hyb|ko]        tail -f server log
+#    llm webui up|down|restart|status|open|logs   Open WebUI chat (docker, :3000)
+#    llm json-status                  JSON status output (for GUI/scripts)
+#
+#  Open WebUI (http://127.0.0.1:3000) is the unified chat front-end wired to all
+#  four endpoints. Managed via systemd user unit llm-openwebui.service (docker
+#  container open-webui). Start a model first (llm up <ep>), then pick it in the UI.
+# ───────────────────────────────────────────────────────────────────────
+set -uo pipefail
+
+ROOT="${LOCAL_LLM_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
+[ -f "$ROOT/config.env" ] && . "$ROOT/config.env"
+LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
+GPU_HOST=127.0.0.1; GPU_PORT="${GPU_PORT:-5000}"; GPU_LOG="$LOGDIR/gpu-tabby.log"
+CPU_HOST=127.0.0.1; CPU_PORT="${CPU_PORT:-5001}"; CPU_LOG="$LOGDIR/cpu-llama.log"
+HYB_HOST=127.0.0.1; HYB_PORT="${HYB_PORT:-5002}"; HYB_LOG="$LOGDIR/gptoss-ik.log"
+KO_HOST=127.0.0.1;  KO_PORT="${KO_PORT:-5003}";  KO_LOG="$LOGDIR/kanana.log"
+GPU_NAME="GPU EXL3/TabbyAPI"; CPU_NAME="CPU llama.cpp"; HYB_NAME="Hybrid gpt-oss-120B"; KO_NAME="Korean Kanana-2"
+WEBUI_HOST=127.0.0.1; WEBUI_PORT=3000; WEBUI_NAME="Open WebUI"
+WEBUI_SVC="llm-openwebui.service"; WEBUI_CONTAINER="open-webui"
+WEBUI_URL="http://$WEBUI_HOST:$WEBUI_PORT"
+
+c_g="\033[32m"; c_r="\033[31m"; c_y="\033[33m"; c_b="\033[36m"; c_0="\033[0m"
+[ -t 1 ] || { c_g=; c_r=; c_y=; c_b=; c_0=; }
+
+# ── low-level helpers ───────────────────────────────────────────────
+_pid_on_port() {  # PID listening on the port (same user)
+  ss -ltnpH "( sport = :$1 )" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1
+}
+_reachable() { curl -s -m 2 "http://$1:$2/v1/models" >/dev/null 2>&1; }
+_webui_reach() { curl -s -m 3 -o /dev/null "$WEBUI_URL/" 2>/dev/null; }  # HTTP 200 if up
+_model_id() {
+  # TabbyAPI /v1/model = 현재 로드된 단일 모델(정확). model_dir에 여러 모델이 있어도 OK.
+  # llama.cpp 엔 /v1/model 없음 → /v1/models[0] 로 폴백(단일 모델이라 정확).
+  local m
+  m=$(curl -s -m 2 "http://$1:$2/v1/model" 2>/dev/null \
+    | python3 -c 'import sys,json
+try:
+    mid=json.load(sys.stdin).get("id")
+    print(mid if mid else "")
+except Exception: print("")' 2>/dev/null)
+  if [ -n "$m" ]; then echo "$m"; return; fi
+  curl -s -m 2 "http://$1:$2/v1/models" 2>/dev/null \
+    | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); print(d["data"][0]["id"])
+except Exception: print("?")' 2>/dev/null
+}
+_err()  { echo -e "${c_r}[err]${c_0} $*" >&2; }
+_ok()   { echo -e "${c_g}[ok]${c_0} $*"; }
+_info() { echo -e "${c_b}[info]${c_0} $*"; }
+_warn() { echo -e "${c_y}[warn]${c_0} $*"; }
+
+# Poll until the port responds (max N*2s)
+_wait_ready() {
+  local host="$1" port="$2" tries="${3:-90}" i
+  for ((i=1; i<=tries; i++)); do
+    _reachable "$host" "$port" && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# ── start ───────────────────────────────────────────────────────────
+# stop a conflicting server if it's up (mutual exclusion)
+_stop_conflict() {  # name host port reason
+  _reachable "$2" "$3" && { _info "stopping $1 (conflicts with $4) ..."; _down_port "$1" "$2" "$3"; }
+  return 0
+}
+_up_gpu() {
+  if _reachable "$GPU_HOST" "$GPU_PORT"; then _ok "$GPU_NAME already up (:$GPU_PORT)"; return 0; fi
+  # gpu shares VRAM with hyb/ko — stop them. (cpu can coexist)
+  _stop_conflict "$HYB_NAME" "$HYB_HOST" "$HYB_PORT" GPU
+  _stop_conflict "$KO_NAME"  "$KO_HOST"  "$KO_PORT"  GPU
+  _info "starting $GPU_NAME ... (log: $GPU_LOG)"
+  ( cd "$ROOT" && nohup ./start-tabby-server.sh >"$GPU_LOG" 2>&1 & )
+  if _wait_ready "$GPU_HOST" "$GPU_PORT" 120; then
+    _ok "$GPU_NAME ready -> http://$GPU_HOST:$GPU_PORT/v1  (model: $(_model_id $GPU_HOST $GPU_PORT))"
+  else
+    _err "$GPU_NAME failed/slow to start. Check: llm logs gpu"; return 1
+  fi
+}
+_up_cpu() {
+  if _reachable "$CPU_HOST" "$CPU_PORT"; then _ok "$CPU_NAME already up (:$CPU_PORT)"; return 0; fi
+  if [ ! -f "$ROOT/cpu/active.env" ]; then
+    _err "CPU not configured. First: llm switch a-moe  (or a-moe-q8/b-light)"; return 1
+  fi
+  # cpu shares RAM with hyb/ko — stop them. (gpu can coexist)
+  _stop_conflict "$HYB_NAME" "$HYB_HOST" "$HYB_PORT" CPU
+  _stop_conflict "$KO_NAME"  "$KO_HOST"  "$KO_PORT"  CPU
+  _info "starting $CPU_NAME ... (model load can take tens of seconds, log: $CPU_LOG)"
+  ( cd "$ROOT" && nohup ./start-cpu-server.sh >"$CPU_LOG" 2>&1 & )
+  if _wait_ready "$CPU_HOST" "$CPU_PORT" 120; then
+    _ok "$CPU_NAME ready -> http://$CPU_HOST:$CPU_PORT/v1  (model: $(_model_id $CPU_HOST $CPU_PORT))"
+  else
+    _err "$CPU_NAME failed/slow to start. Check: llm logs cpu"; return 1
+  fi
+}
+_up_hyb() {
+  if _reachable "$HYB_HOST" "$HYB_PORT"; then _ok "$HYB_NAME already up (:$HYB_PORT)"; return 0; fi
+  # hyb(~14G VRAM + ~49G RAM) is exclusive — stop gpu, cpu, ko.
+  _stop_conflict "$GPU_NAME" "$GPU_HOST" "$GPU_PORT" hyb
+  _stop_conflict "$CPU_NAME" "$CPU_HOST" "$CPU_PORT" hyb
+  _stop_conflict "$KO_NAME"  "$KO_HOST"  "$KO_PORT"  hyb
+  _info "starting $HYB_NAME ... (loads ~60GB, ~1-2 min, log: $HYB_LOG)"
+  ( cd "$ROOT" && nohup ./start-gptoss-server.sh >"$HYB_LOG" 2>&1 & )
+  if _wait_ready "$HYB_HOST" "$HYB_PORT" 180; then
+    _ok "$HYB_NAME ready -> http://$HYB_HOST:$HYB_PORT/v1  (model: $(_model_id $HYB_HOST $HYB_PORT))"
+  else
+    _err "$HYB_NAME failed/slow to start. Check: llm logs hyb"; return 1
+  fi
+}
+_up_ko() {
+  if _reachable "$KO_HOST" "$KO_PORT"; then _ok "$KO_NAME already up (:$KO_PORT)"; return 0; fi
+  # ko(Kanana ~14G VRAM + offload RAM) is exclusive — stop gpu, cpu, hyb.
+  _stop_conflict "$GPU_NAME" "$GPU_HOST" "$GPU_PORT" ko
+  _stop_conflict "$CPU_NAME" "$CPU_HOST" "$CPU_PORT" ko
+  _stop_conflict "$HYB_NAME" "$HYB_HOST" "$HYB_PORT" ko
+  _info "starting $KO_NAME ... (loads ~18GB, ~30s, log: $KO_LOG)"
+  ( cd "$ROOT" && nohup ./start-kanana-server.sh >"$KO_LOG" 2>&1 & )
+  if _wait_ready "$KO_HOST" "$KO_PORT" 120; then
+    _ok "$KO_NAME ready -> http://$KO_HOST:$KO_PORT/v1  (model: $(_model_id $KO_HOST $KO_PORT))"
+  else
+    _err "$KO_NAME failed/slow to start. Check: llm logs ko"; return 1
+  fi
+}
+
+# ── stop (port-based — no bracket trick, no self-kill) ───────────────
+_down_port() {
+  local name="$1" host="$2" port="$3" pid
+  pid="$(_pid_on_port "$port")"
+  if [ -z "$pid" ]; then _info "$name not running (:$port)"; return 0; fi
+  _info "stopping $name (PID $pid) ..."
+  pkill -TERM -P "$pid" 2>/dev/null   # children first
+  kill -TERM "$pid" 2>/dev/null
+  for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
+  if kill -0 "$pid" 2>/dev/null; then
+    _warn "$name did not stop gracefully -> SIGKILL"; pkill -KILL -P "$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null
+  fi
+  _ok "$name stopped"
+}
+
+# ── status ──────────────────────────────────────────────────────────
+_status_line() {  # name host port
+  local name="$1" host="$2" port="$3"
+  if _reachable "$host" "$port"; then
+    printf "  ${c_g}● UP${c_0}   %-22s :%s  model=%s  pid=%s\n" \
+      "$name" "$port" "$(_model_id $host $port)" "$(_pid_on_port $port)"
+  else
+    printf "  ${c_r}○ down${c_0} %-22s :%s\n" "$name" "$port"
+  fi
+}
+cmd_status() {
+  echo -e "${c_b}=== Local LLM endpoints ===${c_0}"
+  _status_line "$GPU_NAME" "$GPU_HOST" "$GPU_PORT"
+  _status_line "$CPU_NAME" "$CPU_HOST" "$CPU_PORT"
+  _status_line "$HYB_NAME" "$HYB_HOST" "$HYB_PORT"
+  _status_line "$KO_NAME"  "$KO_HOST"  "$KO_PORT"
+  echo
+  echo -e "${c_b}=== Front-end ===${c_0}"
+  cmd_webui status
+  echo
+  echo -e "${c_b}=== System ===${c_0}"
+  local cpu; cpu=$(python3 -c 'import psutil;print(f"{psutil.cpu_percent(interval=0.4):.0f}")' 2>/dev/null || echo '?')
+  read -r used tot avail < <(free -m | awk '/^Mem:/{print $3, $2, $7}')
+  printf "  CPU:   %s%%\n" "$cpu"
+  printf "  RAM:   %.1f / %.1f GB used  (free %.1f GB)\n" \
+    "$(echo "$used/1024"|bc -l)" "$(echo "$tot/1024"|bc -l)" "$(echo "$avail/1024"|bc -l)"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local g; g=$(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+    IFS=', ' read -r vu vt gu <<<"$g"
+    printf "  VRAM:  %.1f / %.1f GB used  (util %s%%)\n" \
+      "$(echo "$vu/1024"|bc -l)" "$(echo "$vt/1024"|bc -l)" "$gu"
+  fi
+}
+
+# JSON status for GUI/scripts (single psutil pass)
+cmd_json_status() {
+  GPU_HOST="$GPU_HOST" GPU_PORT="$GPU_PORT" CPU_HOST="$CPU_HOST" CPU_PORT="$CPU_PORT" \
+  HYB_HOST="$HYB_HOST" HYB_PORT="$HYB_PORT" KO_HOST="$KO_HOST" KO_PORT="$KO_PORT" \
+  WEBUI_HOST="$WEBUI_HOST" WEBUI_PORT="$WEBUI_PORT" WEBUI_URL="$WEBUI_URL" \
+  python3 - <<'PY'
+import json, os, subprocess, urllib.request
+def reach(h,p):
+    # TabbyAPI /v1/model = 로드된 모델(정확). 없으면(llama.cpp) /v1/models[0] 폴백.
+    try:
+        with urllib.request.urlopen(f"http://{h}:{p}/v1/model", timeout=2) as r:
+            mid=json.load(r).get("id")
+            if mid: return mid
+    except Exception:
+        pass
+    try:
+        with urllib.request.urlopen(f"http://{h}:{p}/v1/models", timeout=2) as r:
+            d=json.load(r); return d["data"][0]["id"]
+    except Exception:
+        return None
+def http_ok(url):
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            return 200 <= r.status < 400
+    except Exception:
+        return False
+def pid_on(port):
+    try:
+        out=subprocess.run(["ss","-ltnpH",f"( sport = :{port} )"],capture_output=True,text=True,timeout=3).stdout
+        import re; m=re.search(r"pid=(\d+)",out); return int(m.group(1)) if m else None
+    except Exception: return None
+try:
+    import psutil
+    cpu=psutil.cpu_percent(interval=0.3)
+    vm=psutil.virtual_memory()
+    ram=dict(used=vm.used, total=vm.total, avail=vm.available, percent=vm.percent)
+except Exception:
+    cpu=None; ram=None
+gpu=None
+try:
+    out=subprocess.run(["nvidia-smi","--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu",
+        "--format=csv,noheader,nounits"],capture_output=True,text=True,timeout=4).stdout.strip().splitlines()[0]
+    vu,vt,gu,gt=[x.strip() for x in out.split(",")]
+    gpu=dict(vram_used_mb=float(vu), vram_total_mb=float(vt), util=float(gu), temp=float(gt))
+except Exception: pass
+g=os.environ
+print(json.dumps({
+ "gpu_ep":{"name":"GPU EXL3","host":g["GPU_HOST"],"port":int(g["GPU_PORT"]),
+           "model":reach(g["GPU_HOST"],int(g["GPU_PORT"])),"pid":pid_on(int(g["GPU_PORT"]))},
+ "cpu_ep":{"name":"CPU llama.cpp","host":g["CPU_HOST"],"port":int(g["CPU_PORT"]),
+           "model":reach(g["CPU_HOST"],int(g["CPU_PORT"])),"pid":pid_on(int(g["CPU_PORT"]))},
+ "hyb_ep":{"name":"Hybrid gpt-oss","host":g["HYB_HOST"],"port":int(g["HYB_PORT"]),
+           "model":reach(g["HYB_HOST"],int(g["HYB_PORT"])),"pid":pid_on(int(g["HYB_PORT"]))},
+ "ko_ep":{"name":"Korean Kanana-2","host":g["KO_HOST"],"port":int(g["KO_PORT"]),
+           "model":reach(g["KO_HOST"],int(g["KO_PORT"])),"pid":pid_on(int(g["KO_PORT"]))},
+ "webui_ep":{"name":"Open WebUI","host":g["WEBUI_HOST"],"port":int(g["WEBUI_PORT"]),
+           "url":g["WEBUI_URL"],"up":http_ok(g["WEBUI_URL"]+"/")},
+ "cpu_pct":cpu,"ram":ram,"gpu":gpu,
+}))
+PY
+}
+
+# ── query / chat ────────────────────────────────────────────────────
+_target() {  # parse --cpu/--gpu/--hyb -> echo "host port"
+  case "${1:-}" in
+    --cpu|cpu) echo "$CPU_HOST $CPU_PORT" ;;
+    --hyb|hyb) echo "$HYB_HOST $HYB_PORT" ;;
+    --ko|ko)   echo "$KO_HOST $KO_PORT" ;;
+    --gpu|gpu) echo "$GPU_HOST $GPU_PORT" ;;
+    *)  # auto: first reachable endpoint (gpu > ko > hyb > cpu)
+        for pair in "$GPU_HOST $GPU_PORT" "$KO_HOST $KO_PORT" "$HYB_HOST $HYB_PORT" "$CPU_HOST $CPU_PORT"; do
+          set -- $pair; _reachable "$1" "$2" && { echo "$pair"; return; }
+        done
+        echo "$GPU_HOST $GPU_PORT" ;;
+  esac
+}
+cmd_ask() {
+  local prompt="" tgt="auto" a
+  for a in "$@"; do
+    case "$a" in --cpu) tgt=cpu;; --gpu) tgt=gpu;; --hyb) tgt=hyb;; --ko) tgt=ko;; *) prompt="$a";; esac
+  done
+  [ -n "$prompt" ] || { _err 'llm ask "prompt" [--cpu|--gpu|--hyb|--ko]'; return 1; }
+  read -r host port < <(_target "$tgt")
+  _reachable "$host" "$port" || { _err "$tgt endpoint not up (:$port). First: llm up $tgt"; return 1; }
+  HOST="$host" PORT="$port" PROMPT="$prompt" python3 - <<'PY'
+import os, json, urllib.request
+host,port,prompt=os.environ["HOST"],os.environ["PORT"],os.environ["PROMPT"]
+body=json.dumps({"model":"local","messages":[{"role":"user","content":prompt}],
+                 "temperature":0.3,"stream":True}).encode()
+req=urllib.request.Request(f"http://{host}:{port}/v1/chat/completions",data=body,
+                           headers={"Content-Type":"application/json"})
+with urllib.request.urlopen(req) as r:
+    for raw in r:
+        line=raw.decode("utf-8","ignore").strip()
+        if not line.startswith("data:"): continue
+        p=line[5:].strip()
+        if p=="[DONE]": break
+        try: obj=json.loads(p)
+        except Exception: continue
+        delta=(obj.get("choices") or [{}])[0].get("delta",{}).get("content","")
+        if delta: print(delta,end="",flush=True)
+print()
+PY
+}
+cmd_chat() {
+  local tgt="${1:-}"; read -r host port < <(_target "${tgt#--}")
+  _reachable "$host" "$port" || { _err "endpoint not up (:$port). First: llm up"; return 1; }
+  echo -e "${c_b}chat started${c_0} (model=$(_model_id $host $port), :$port).  exit: /exit  reset: /reset"
+  # ★ Run the REPL as a FILE so python's stdin stays the terminal (input() works).
+  #   `python3 - <<heredoc` would feed the script itself to stdin → input() hits EOF instantly.
+  HOST="$host" PORT="$port" exec python3 "$ROOT/lib/llm_chat.py"
+}
+
+# ── profile switch ──────────────────────────────────────────────────
+cmd_switch() {
+  local p="${1:-}"
+  [ -n "$p" ] || { "$ROOT/setup-cpu.sh" --list; return 0; }
+  local was_up=0; _reachable "$CPU_HOST" "$CPU_PORT" && was_up=1
+  _info "switching CPU profile -> $p"
+  "$ROOT/setup-cpu.sh" "$p" || { _err "switch failed"; return 1; }
+  if [ "$was_up" = 1 ]; then
+    _info "restarting CPU server to apply new profile ..."
+    _down_port "$CPU_NAME" "$CPU_HOST" "$CPU_PORT"; _up_cpu
+  else
+    _ok "switched. Start: llm up cpu"
+  fi
+}
+
+# ── bench / logs ────────────────────────────────────────────────────
+cmd_bench() {
+  case "${1:-gpu}" in
+    cpu) "$ROOT/bench-cpu.sh" "${@:2}" ;;
+    hyb) "$ROOT/bench-gptoss-ik.sh" "${@:2}" ;;
+    *)   "$ROOT/bench-exl3.sh" "${@:2}" ;;
+  esac
+}
+cmd_logs() {
+  case "${1:-gpu}" in cpu) tail -f "$CPU_LOG" ;; hyb) tail -f "$HYB_LOG" ;; ko) tail -f "$KO_LOG" ;; *) tail -f "$GPU_LOG" ;; esac
+}
+
+# ── Open WebUI (docker container via systemd user unit) ──────────────
+cmd_webui() {
+  case "${1:-status}" in
+    up|start)
+      if _webui_reach; then _ok "$WEBUI_NAME already up -> $WEBUI_URL"; return 0; fi
+      _info "starting $WEBUI_NAME ($WEBUI_SVC) ..."
+      systemctl --user start "$WEBUI_SVC" 2>/dev/null || docker start "$WEBUI_CONTAINER" >/dev/null 2>&1
+      for _ in $(seq 1 30); do _webui_reach && break; sleep 1; done
+      if _webui_reach; then _ok "$WEBUI_NAME ready -> $WEBUI_URL  (pick a started model in the UI)"
+      else _err "$WEBUI_NAME failed/slow. Check: llm webui logs"; return 1; fi ;;
+    down|stop)
+      _info "stopping $WEBUI_NAME ..."
+      systemctl --user stop "$WEBUI_SVC" 2>/dev/null || docker stop -t 10 "$WEBUI_CONTAINER" >/dev/null 2>&1
+      _ok "$WEBUI_NAME stopped" ;;
+    restart) cmd_webui down; sleep 1; cmd_webui up ;;
+    open)
+      _webui_reach || { _warn "$WEBUI_NAME not up — starting first"; cmd_webui up || return 1; }
+      command -v xdg-open >/dev/null 2>&1 && xdg-open "$WEBUI_URL" >/dev/null 2>&1 &
+      _ok "opened $WEBUI_URL" ;;
+    logs) docker logs -f "$WEBUI_CONTAINER" ;;
+    status|*)
+      if _webui_reach; then
+        printf "  ${c_g}● UP${c_0}   %-22s %s  (svc: %s)\n" "$WEBUI_NAME" "$WEBUI_URL" \
+          "$(systemctl --user is-active "$WEBUI_SVC" 2>/dev/null || echo '?')"
+      else
+        printf "  ${c_r}○ down${c_0} %-22s %s\n" "$WEBUI_NAME" "$WEBUI_URL"
+      fi ;;
+  esac
+}
+
+# ── dispatch ────────────────────────────────────────────────────────
+case "${1:-status}" in
+  up)      case "${2:-both}" in gpu) _up_gpu;; cpu) _up_cpu;; hyb) _up_hyb;; ko) _up_ko;; both) _up_gpu; _up_cpu;; *) _err "up [gpu|cpu|hyb|ko|both]";; esac ;;
+  down)    case "${2:-all}" in
+             gpu) _down_port "$GPU_NAME" "$GPU_HOST" "$GPU_PORT";;
+             cpu) _down_port "$CPU_NAME" "$CPU_HOST" "$CPU_PORT";;
+             hyb) _down_port "$HYB_NAME" "$HYB_HOST" "$HYB_PORT";;
+             ko)  _down_port "$KO_NAME"  "$KO_HOST"  "$KO_PORT";;
+             all) _down_port "$GPU_NAME" "$GPU_HOST" "$GPU_PORT"; _down_port "$CPU_NAME" "$CPU_HOST" "$CPU_PORT"; _down_port "$HYB_NAME" "$HYB_HOST" "$HYB_PORT"; _down_port "$KO_NAME" "$KO_HOST" "$KO_PORT";;
+             *) _err "down [gpu|cpu|hyb|ko|all]";; esac ;;
+  restart) "$0" down "${2:-both}"; sleep 1; "$0" up "${2:-both}" ;;
+  status)       cmd_status ;;
+  json-status)  cmd_json_status ;;
+  models)  echo "[$GPU_NAME] $(_model_id $GPU_HOST $GPU_PORT)"; echo "[$CPU_NAME] $(_model_id $CPU_HOST $CPU_PORT)"; echo "[$HYB_NAME] $(_model_id $HYB_HOST $HYB_PORT)"; echo "[$KO_NAME] $(_model_id $KO_HOST $KO_PORT)" ;;
+  ask)     shift; cmd_ask "$@" ;;
+  chat)    shift; cmd_chat "$@" ;;
+  switch)  shift; cmd_switch "$@" ;;
+  bench)   shift; cmd_bench "$@" ;;
+  logs)    shift; cmd_logs "$@" ;;
+  webui)   shift; cmd_webui "$@" ;;
+  -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) _err "unknown command: $1"; sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

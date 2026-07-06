@@ -1,0 +1,15 @@
+[Unit]
+Description=Local LLM browser MCP (Playwright headless Chrome :8931)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
+# Adjust the path if your repo is not at ~/0_AI/local-llm:
+ExecStart=%h/0_AI/local-llm/agent/start-browser-mcp.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

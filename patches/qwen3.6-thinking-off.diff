@@ -1,0 +1,22 @@
+# Qwen3.6 EXL3: make thinking OFF the default
+#
+# Flips the enable_thinking default in the model's chat_template.jinja so the model
+# runs concise (no <think>) unless a request opts in with chat_template_kwargs:{enable_thinking:true}.
+# Apply to your Qwen3.6-*-EXL3 model dir:  patch -p0 < patches/qwen3.6-thinking-off.diff
+#
+--- chat_template.jinja.orig	2026-07-06 04:53:47.496092889 +0900
++++ chat_template.jinja	2026-07-06 04:53:54.190198966 +0900
+@@ -146,9 +146,9 @@
+ {%- endfor %}
+ {%- if add_generation_prompt %}
+     {{- '<|im_start|>assistant\n' }}
+-    {%- if enable_thinking is defined and enable_thinking is false %}
+-        {{- '<think>\n\n</think>\n\n' }}
+-    {%- else %}
++    {%- if enable_thinking is defined and enable_thinking is true %}
+         {{- '<think>\n' }}
++    {%- else %}
++        {{- '<think>\n\n</think>\n\n' }}
+     {%- endif %}
+ {%- endif %}
+\ No newline at end of file

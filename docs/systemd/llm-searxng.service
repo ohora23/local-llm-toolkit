@@ -1,0 +1,15 @@
+[Unit]
+Description=Local LLM SearXNG search (docker, :8888)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust docker path (/snap/bin/docker vs /usr/bin/docker). Container must already exist.
+ExecStart=/snap/bin/docker start -a searxng
+ExecStop=/snap/bin/docker stop -t 10 searxng
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

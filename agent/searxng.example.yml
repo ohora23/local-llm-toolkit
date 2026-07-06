@@ -1,0 +1,14 @@
+# Example SearXNG config for the Goose web agent's search MCP.
+# Copy to agent/searxng/settings.yml (docker-mounted) and set your own secret.
+use_default_settings: true
+server:
+  # Generate your own: `openssl rand -hex 32` — do NOT reuse any published key.
+  secret_key: "CHANGE_ME_openssl_rand_hex_32"
+  bind_address: "0.0.0.0"   # container-internal bind for the local SearXNG (docker)
+  limiter: false
+  image_proxy: false
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
