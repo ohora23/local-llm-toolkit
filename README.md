@@ -69,7 +69,8 @@ Third-party models are downloaded by the setup scripts (not redistributed here).
 **derived model** published alongside this repo:
 
 - **Kanana-2-30B-A3B GGUF (Q4_K_M)** — a GGUF conversion of `kakaocorp/Kanana-2` (its MLA/MoE arch
-  isn't supported by EXL3, so GGUF is the path to run it on this card). → `<HF_USER>/Kanana-2-30B-A3B-Instruct-GGUF` *(link filled on upload)*
+  isn't supported by EXL3, so GGUF is the path to run it on this card).
+  → [**ohora23/Kanana-2-30B-A3B-Instruct-GGUF**](https://huggingface.co/ohora23/Kanana-2-30B-A3B-Instruct-GGUF) on Hugging Face
 
 ## License
 
