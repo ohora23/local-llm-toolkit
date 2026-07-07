@@ -74,6 +74,11 @@ N_CPU_MOE=31 ./llm up hyb    # override the GPU/CPU split
 ./llm bench hyb              # speed + 4-axis quality (bench-hybrid.sh)
 ```
 
+Loads with **`--no-mmap`** by default: the ~60 GB of CPU-side experts are read into real RAM
+*before* the server accepts requests, so "up" (and the GUI's green light) means **actually loaded**,
+not "port open while pages lazily fault in." Needs ~64 GB RAM free for this endpoint. Prefer mmap's
+instant warm restarts (at the cost of a premature-ready signal + slow first token)? `USE_MMAP=1 ./llm up hyb`.
+
 Reasoning is **off by default** (fast). Enable per request with
 `chat_template_kwargs: {"reasoning_effort": "high"}` — the model then emits `[THINK]…[/THINK]` and
 solves harder logic reliably (the top-level OpenAI `reasoning_effort` field is *not* forwarded to the

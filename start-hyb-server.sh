@@ -16,6 +16,10 @@ CTX="${CTX:-8192}"
 THREADS="${THREADS:-8}"
 PORT="${PORT:-5002}"
 export GGML_CUDA_NO_PINNED="${GGML_CUDA_NO_PINNED:-1}"   # 74G 모델 / RAM 여유 확보(핀 메모리 회피)
+# 기본 --no-mmap: expert weight를 실제 RAM으로 미리 읽어들인 뒤 서버 기동.
+#   → 서버 UP = RAM 로드 완료(인디케이터 정직) + RAM이 page cache 아닌 "used"로 표시.
+#   mmap 지연로딩이 좋으면(빠른 재기동, 캐시공유) USE_MMAP=1. (단, 조기 ready·느린 첫 추론)
+MMAP_FLAG="--no-mmap"; [ "${USE_MMAP:-0}" = "1" ] && MMAP_FLAG=""
 
 [ -x "$IK/llama-server" ] || { echo "[err] ik_llama.cpp llama-server 없음: $IK/llama-server"; exit 1; }
 [ -f "$M" ] || { echo "[err] 모델 없음: $M  (먼저: ./download-model.sh hyb)"; exit 1; }
@@ -24,5 +28,5 @@ echo "[info] Mistral-Small-4 하이브리드(ik_llama.cpp) → http://127.0.0.1:
 echo "       n-cpu-moe=$NCM  ctx=$CTX  threads=$THREADS  (VRAM~13G + RAM~60G)"
 nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null || true
 # 주의: GPU EXL3(:5000)·ko 와 VRAM·RAM 겹쳐 동시구동 불가(택1).
-exec "$IK/llama-server" -m "$M" -ngl 999 --n-cpu-moe "$NCM" -t "$THREADS" -c "$CTX" \
+exec "$IK/llama-server" -m "$M" -ngl 999 --n-cpu-moe "$NCM" $MMAP_FLAG -t "$THREADS" -c "$CTX" \
   --host 127.0.0.1 --port "$PORT" --jinja -a mistral-small-4
