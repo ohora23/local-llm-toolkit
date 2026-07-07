@@ -157,24 +157,13 @@ fn open_terminal(args: &[&str]) -> bool {
     false
 }
 
-// Force HYB to be the only active model, then open Open WebUI in a Chrome window.
-// `llm up hyb` stops gpu/cpu/ko (mutual exclusion) and loads gpt-oss-120B if it
-// isn't already up — the model that drives the multi-agent Planner pipe. Runs
-// off-thread so the UI never blocks (cold start of hyb can take ~1-2 min; the
-// HYB title chip lights up when ready). Prefers Chrome app window, then Chromium,
-// then falls back to `llm webui open` (xdg-open).
+// Open Open WebUI in a Chrome window (start the docker container if it isn't up).
+// Runs off-thread so the UI never blocks. Pick whichever model you want first with
+// its side-card button; the UI lists every running endpoint. Prefers Chrome app
+// window, then Chromium, then falls back to `llm webui open` (xdg-open).
 fn open_webui_chrome(s: app::Sender<Msg>) {
     const URL: &str = "http://127.0.0.1:3000";
     thread::spawn(move || {
-        s.send(Msg::Log(
-            "$ llm up hyb  (HYB only: stopping others, loading gpt-oss-120B if down — up to ~2 min)".into(),
-        ));
-        if let Ok(o) = Command::new(llm()).args(["up", "hyb"]).output() {
-            let t = String::from_utf8_lossy(&o.stdout);
-            if let Some(last) = t.lines().rev().find(|l| !l.trim().is_empty()) {
-                s.send(Msg::Log(last.trim().to_string()));
-            }
-        }
         s.send(Msg::Log("$ llm webui up".into()));
         let _ = Command::new(llm()).args(["webui", "up"]).output();
         for bin in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"] {
@@ -288,9 +277,9 @@ fn main() {
         side_card(12, 32, "GPU  -  EXL3 (TabbyAPI)", "gpu", s, shared.clone());
     let (mut cpu_led, mut cpu_dot, mut cpu_model) =
         side_card(284, 32, "CPU  -  llama.cpp", "cpu", s, shared.clone());
-    // exclusive GPU models row: HYB (gpt-oss) + KO (Kanana, Korean)
+    // exclusive GPU models row: HYB (Mistral-Small-4, hybrid) + KO (Kanana, Korean)
     let (mut hyb_led, mut hyb_dot, mut hyb_model) =
-        side_card(12, 186, "HYB  -  gpt-oss 120B", "hyb", s, shared.clone());
+        side_card(12, 186, "HYB  -  Mistral-Small-4", "hyb", s, shared.clone());
     let (mut ko_led, mut ko_dot, mut ko_model) =
         side_card(284, 186, "KO  -  Kanana-2 (KR)", "ko", s, shared.clone());
 

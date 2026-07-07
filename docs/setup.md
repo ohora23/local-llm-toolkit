@@ -33,9 +33,9 @@ cmake -S . -B build-cpu -DGGML_CUDA=OFF -DGGML_NATIVE=ON
 cmake --build build-cpu --target llama-server llama-cli -j8
 ```
 
-## 3. ik_llama.cpp — hybrid gpt-oss (`hyb`)
+## 3. ik_llama.cpp — hybrid Mistral-Small-4 (`hyb`)
 
-For running a 117B MoE split across GPU+CPU. Clone to `$IK_DIR` (default `~/0_AI/ik_llama.cpp`):
+For running a 119B MoE (6B active) split across GPU+CPU. Clone to `$IK_DIR` (default `~/0_AI/ik_llama.cpp`):
 
 ```bash
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DGGML_NATIVE=ON

@@ -8,7 +8,7 @@
 #  Endpoints:
 #    gpu  EXL3/TabbyAPI :5000   Qwen3-Coder-30B full-GPU (~110 tok/s) — 영어/코딩
 #    cpu  llama.cpp     :5001   Qwen3-Coder-30B-A3B CPU-only (VRAM 0)
-#    hyb  ik_llama.cpp  :5002   gpt-oss-120B MXFP4 GPU+CPU hybrid (~30 tok/s) — 대형/범용
+#    hyb  ik_llama.cpp  :5002   Mistral-Small-4-119B GPU+CPU hybrid (~25 tok/s) — 대형/범용/추론
 #    ko   llama.cpp     :5003   Kanana-2-30B-A3B GGUF GPU (~9s 에이전트) — 한국어 네이티브
 #         ⚠ gpu·hyb·ko 는 VRAM 이 겹쳐 동시구동 불가 — 셋 중 택1. (gpu+cpu 만 공존)
 #
@@ -37,9 +37,9 @@ ROOT="${LOCAL_LLM_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
 LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
 GPU_HOST=127.0.0.1; GPU_PORT="${GPU_PORT:-5000}"; GPU_LOG="$LOGDIR/gpu-tabby.log"
 CPU_HOST=127.0.0.1; CPU_PORT="${CPU_PORT:-5001}"; CPU_LOG="$LOGDIR/cpu-llama.log"
-HYB_HOST=127.0.0.1; HYB_PORT="${HYB_PORT:-5002}"; HYB_LOG="$LOGDIR/gptoss-ik.log"
+HYB_HOST=127.0.0.1; HYB_PORT="${HYB_PORT:-5002}"; HYB_LOG="$LOGDIR/hyb.log"
 KO_HOST=127.0.0.1;  KO_PORT="${KO_PORT:-5003}";  KO_LOG="$LOGDIR/kanana.log"
-GPU_NAME="GPU EXL3/TabbyAPI"; CPU_NAME="CPU llama.cpp"; HYB_NAME="Hybrid gpt-oss-120B"; KO_NAME="Korean Kanana-2"
+GPU_NAME="GPU EXL3/TabbyAPI"; CPU_NAME="CPU llama.cpp"; HYB_NAME="Hybrid Mistral-Small-4"; KO_NAME="Korean Kanana-2"
 WEBUI_HOST=127.0.0.1; WEBUI_PORT=3000; WEBUI_NAME="Open WebUI"
 WEBUI_SVC="llm-openwebui.service"; WEBUI_CONTAINER="open-webui"
 WEBUI_URL="http://$WEBUI_HOST:$WEBUI_PORT"
@@ -91,8 +91,11 @@ _stop_conflict() {  # name host port reason
   _reachable "$2" "$3" && { _info "stopping $1 (conflicts with $4) ..."; _down_port "$1" "$2" "$3"; }
   return 0
 }
+# ensure the endpoint's model is present, downloading it on first use. no-op if already there.
+_ensure_model() { "$ROOT/download-model.sh" "$1" || { _err "$1 모델 다운로드 실패"; return 1; }; }
 _up_gpu() {
   if _reachable "$GPU_HOST" "$GPU_PORT"; then _ok "$GPU_NAME already up (:$GPU_PORT)"; return 0; fi
+  _ensure_model gpu || return 1
   # gpu shares VRAM with hyb/ko — stop them. (cpu can coexist)
   _stop_conflict "$HYB_NAME" "$HYB_HOST" "$HYB_PORT" GPU
   _stop_conflict "$KO_NAME"  "$KO_HOST"  "$KO_PORT"  GPU
@@ -106,6 +109,7 @@ _up_gpu() {
 }
 _up_cpu() {
   if _reachable "$CPU_HOST" "$CPU_PORT"; then _ok "$CPU_NAME already up (:$CPU_PORT)"; return 0; fi
+  _ensure_model cpu || return 1
   if [ ! -f "$ROOT/cpu/active.env" ]; then
     _err "CPU not configured. First: llm switch a-moe  (or a-moe-q8/b-light)"; return 1
   fi
@@ -122,13 +126,14 @@ _up_cpu() {
 }
 _up_hyb() {
   if _reachable "$HYB_HOST" "$HYB_PORT"; then _ok "$HYB_NAME already up (:$HYB_PORT)"; return 0; fi
-  # hyb(~14G VRAM + ~49G RAM) is exclusive — stop gpu, cpu, ko.
+  _ensure_model hyb || return 1
+  # hyb(~13G VRAM + ~60G RAM) is exclusive — stop gpu, cpu, ko.
   _stop_conflict "$GPU_NAME" "$GPU_HOST" "$GPU_PORT" hyb
   _stop_conflict "$CPU_NAME" "$CPU_HOST" "$CPU_PORT" hyb
   _stop_conflict "$KO_NAME"  "$KO_HOST"  "$KO_PORT"  hyb
-  _info "starting $HYB_NAME ... (loads ~60GB, ~1-2 min, log: $HYB_LOG)"
-  ( cd "$ROOT" && nohup ./start-gptoss-server.sh >"$HYB_LOG" 2>&1 & )
-  if _wait_ready "$HYB_HOST" "$HYB_PORT" 180; then
+  _info "starting $HYB_NAME ... (loads ~74GB, ~2-3 min, log: $HYB_LOG)"
+  ( cd "$ROOT" && nohup ./start-hyb-server.sh >"$HYB_LOG" 2>&1 & )
+  if _wait_ready "$HYB_HOST" "$HYB_PORT" 360; then
     _ok "$HYB_NAME ready -> http://$HYB_HOST:$HYB_PORT/v1  (model: $(_model_id $HYB_HOST $HYB_PORT))"
   else
     _err "$HYB_NAME failed/slow to start. Check: llm logs hyb"; return 1
@@ -136,6 +141,7 @@ _up_hyb() {
 }
 _up_ko() {
   if _reachable "$KO_HOST" "$KO_PORT"; then _ok "$KO_NAME already up (:$KO_PORT)"; return 0; fi
+  _ensure_model ko || return 1
   # ko(Kanana ~14G VRAM + offload RAM) is exclusive — stop gpu, cpu, hyb.
   _stop_conflict "$GPU_NAME" "$GPU_HOST" "$GPU_PORT" ko
   _stop_conflict "$CPU_NAME" "$CPU_HOST" "$CPU_PORT" ko
@@ -249,7 +255,7 @@ print(json.dumps({
            "model":reach(g["GPU_HOST"],int(g["GPU_PORT"])),"pid":pid_on(int(g["GPU_PORT"]))},
  "cpu_ep":{"name":"CPU llama.cpp","host":g["CPU_HOST"],"port":int(g["CPU_PORT"]),
            "model":reach(g["CPU_HOST"],int(g["CPU_PORT"])),"pid":pid_on(int(g["CPU_PORT"]))},
- "hyb_ep":{"name":"Hybrid gpt-oss","host":g["HYB_HOST"],"port":int(g["HYB_PORT"]),
+ "hyb_ep":{"name":"Hybrid Mistral-Small-4","host":g["HYB_HOST"],"port":int(g["HYB_PORT"]),
            "model":reach(g["HYB_HOST"],int(g["HYB_PORT"])),"pid":pid_on(int(g["HYB_PORT"]))},
  "ko_ep":{"name":"Korean Kanana-2","host":g["KO_HOST"],"port":int(g["KO_PORT"]),
            "model":reach(g["KO_HOST"],int(g["KO_PORT"])),"pid":pid_on(int(g["KO_PORT"]))},
@@ -330,7 +336,7 @@ cmd_switch() {
 cmd_bench() {
   case "${1:-gpu}" in
     cpu) "$ROOT/bench-cpu.sh" "${@:2}" ;;
-    hyb) "$ROOT/bench-gptoss-ik.sh" "${@:2}" ;;
+    hyb) "$ROOT/bench-hybrid.sh" "${HYB_MODEL:-${MODEL_STORE:-$HOME/b_Models}/Mistral-Small-4-119B-Q4_K_XL/UD-Q4_K_XL/Mistral-Small-4-119B-2603-UD-Q4_K_XL-00001-of-00003.gguf}" mistral-small-4 "${N_CPU_MOE:-31}" ;;
     *)   "$ROOT/bench-exl3.sh" "${@:2}" ;;
   esac
 }

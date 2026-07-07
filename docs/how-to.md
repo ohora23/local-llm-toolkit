@@ -62,15 +62,22 @@ Runs a second LLM entirely on CPU/RAM so it never touches the GPU (uses the `bui
 ./llm up cpu        # now gpu + cpu run in parallel
 ```
 
-## `hyb` — ik_llama.cpp (gpt-oss-120B, GPU+CPU MoE offload)
+## `hyb` — ik_llama.cpp (Mistral-Small-4-119B, GPU+CPU MoE offload)
 
-Runs a 117B MoE that doesn't fit VRAM by splitting experts to RAM. Tune `N_CPU_MOE` (lower = more on
-GPU = faster, until OOM; ~30–32 is the sweet spot on 16 GB).
+Runs a 119B MoE (6B active) that doesn't fit VRAM by splitting experts to RAM. Tune `N_CPU_MOE`
+(lower = more on GPU = faster, until OOM; 31 is the safe sweet spot on 16 GB — ~25 tok/s at Q4).
+`llm up hyb` auto-downloads the model on first use.
 
 ```bash
-N_CPU_MOE=30 ./llm up hyb
-./bench-gptoss-ik.sh          # sweep N_CPU_MOE
+./llm up hyb                 # downloads Mistral-Small-4 Q4 (~74 GB) if missing, then serves
+N_CPU_MOE=31 ./llm up hyb    # override the GPU/CPU split
+./llm bench hyb              # speed + 4-axis quality (bench-hybrid.sh)
 ```
+
+Reasoning is **off by default** (fast). Enable per request with
+`chat_template_kwargs: {"reasoning_effort": "high"}` — the model then emits `[THINK]…[/THINK]` and
+solves harder logic reliably (the top-level OpenAI `reasoning_effort` field is *not* forwarded to the
+template, so it must go through `chat_template_kwargs`).
 
 ## `ko` — Kanana-2-30B (native Korean)
 

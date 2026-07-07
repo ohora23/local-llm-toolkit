@@ -35,7 +35,7 @@ All OpenAI-compatible on `127.0.0.1`. GPU-heavy ones are mutually exclusive (the
 |---|---|---|---|---|
 | `gpu` | 5000 | ExLlamaV3 / TabbyAPI | Qwen3-Coder-30B-A3B (EXL3 3.0bpw) | fast coding (~115 tok/s), agent tool-calls |
 | `cpu` | 5001 | llama.cpp (CPU-only) | Qwen3-Coder-30B-A3B (GGUF) | background helper, **VRAM 0** |
-| `hyb` | 5002 | ik_llama.cpp | gpt-oss-120B (MXFP4) | big-brain, GPU+CPU MoE offload (~30 tok/s) |
+| `hyb` | 5002 | ik_llama.cpp | Mistral-Small-4-119B (Q4) | big-brain / reasoning, GPU+CPU MoE offload (~25 tok/s) |
 | `ko` | 5003 | llama.cpp (GPU) | **Kanana-2-30B** (GGUF) | native Korean |
 
 ## Quickstart
@@ -45,12 +45,15 @@ git clone <this-repo> local-llm-toolkit && cd local-llm-toolkit
 cp config.env.example config.env      # point at your model store + engine builds
 # ... build the engines you need (see docs/setup.md) ...
 
-./llm up gpu        # start the GPU coder
+./llm up gpu        # auto-downloads the endpoint's model if missing, then starts it
 ./llm status        # see what's running + CPU/RAM/VRAM
 ./llm chat --gpu    # talk to it
 ./llm switch b-quality   # hot-swap serving profile
 ./llm bench gpu     # measure tok/s
 ```
+
+`llm up <gpu|cpu|hyb|ko>` downloads that endpoint's model on first use (via `download-model.sh`) —
+no manual fetch step. `./download-model.sh <ep>` pre-fetches without starting.
 
 GUI: `cargo build --release --manifest-path llm-panel-rs/Cargo.toml` then run
 `llm-panel-rs/target/release/llm-panel` (set `LLM_CLI` if the repo isn't at `~/0_AI/local-llm`).

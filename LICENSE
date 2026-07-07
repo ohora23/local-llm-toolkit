@@ -22,4 +22,4 @@ SOFTWARE.
 
 Note: this license covers the toolkit's own scripts/code. The models, engines,
 and upstream projects it orchestrates (llama.cpp, ik_llama.cpp, ExLlamaV3 /
-TabbyAPI, vLLM, Ollama, Qwen, Kanana, gpt-oss, etc.) carry their own licenses.
+TabbyAPI, vLLM, Ollama, Qwen, Kanana, Mistral, etc.) carry their own licenses.
