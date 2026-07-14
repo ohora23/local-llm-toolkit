@@ -27,7 +27,9 @@ PROBLEMS = [
 ]
 
 def ask(prompt):
-    payload={"model":MODEL,"messages":[{"role":"user","content":prompt}],"temperature":0.0,"max_tokens":2000}
+    msgs=[{"role":"user","content":prompt}]
+    if os.environ.get("SYSPROMPT"): msgs.insert(0,{"role":"system","content":os.environ["SYSPROMPT"]})
+    payload={"model":MODEL,"messages":msgs,"temperature":0.0,"max_tokens":int(os.environ.get("MAXTOK","2000"))}
     if os.environ.get("NOTHINK")=="1": payload["chat_template_kwargs"]={"enable_thinking":False}
     req=urllib.request.Request(BASE+"/v1/chat/completions",data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"})
     with urllib.request.urlopen(req,timeout=240) as r: return json.load(r)["choices"][0]["message"]["content"] or ""

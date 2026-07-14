@@ -147,7 +147,7 @@ Output BOTH files, each as:
 """
 
 def ask(prompt):
-    p = {"model":"m","messages":[{"role":"user","content":prompt}],"temperature":0,"max_tokens":6000}
+    p = {"model":"m","messages":[{"role":"user","content":prompt}],"temperature":0,"max_tokens":int(os.environ.get("MAXTOK","6000"))}
     if os.environ.get("NOKWARG") != "1":  # non-thinking 모델(Qwen3-Coder)엔 kwarg 생략
         p["chat_template_kwargs"] = {"enable_thinking": (not NOTHINK)}
     req = urllib.request.Request(BASE+"/v1/chat/completions", data=json.dumps(p).encode(),

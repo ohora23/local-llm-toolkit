@@ -33,7 +33,7 @@ All OpenAI-compatible on `127.0.0.1`. GPU-heavy ones are mutually exclusive (the
 
 | Alias | Port | Engine | Default model | Role |
 |---|---|---|---|---|
-| `gpu` | 5000 | ExLlamaV3 / TabbyAPI | Qwen3-Coder-30B-A3B (EXL3 3.0bpw) | fast coding (~115 tok/s), agent tool-calls |
+| `gpu` | 5000 | ExLlamaV3 / TabbyAPI | Ornith-1.0-35B-A3B (EXL3 3.08bpw) | coding + **128 K context** (hybrid attn), ~130 tok/s; Qwen3-Coder-30B is the one-command fallback |
 | `cpu` | 5001 | llama.cpp (CPU-only) | Qwen3-Coder-30B-A3B (GGUF) | background helper, **VRAM 0** |
 | `hyb` | 5002 | ik_llama.cpp | Mistral-Small-4-119B (Q4) | big-brain / reasoning, GPU+CPU MoE offload (~25 tok/s) |
 | `ko` | 5003 | llama.cpp (GPU) | **Kanana-2-30B** (GGUF) | native Korean |

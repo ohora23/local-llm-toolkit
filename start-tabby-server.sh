@@ -14,4 +14,15 @@ fi
 echo "[info] 기동 전 VRAM:"
 nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader || true
 
+# 워밍업: 로드 완료(포트 오픈) 후 더미 요청 1회로 cudagraph/커널 예열 → 첫 실사용 TTFT 정상화
+# (예열 안 하면 첫 추론이 워밍업 아티팩트로 수 초 걸림; Ornith에서 3.4s→0.17s 확인)
+( for _ in $(seq 1 180); do
+    curl -sf "http://$TABBY_HOST:$TABBY_PORT/v1/models" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  curl -sf "http://$TABBY_HOST:$TABBY_PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"m","messages":[{"role":"user","content":"ping"}],"max_tokens":8,"chat_template_kwargs":{"enable_thinking":false}}' \
+    >/dev/null 2>&1 && echo "[warmup] 예열 완료 — 첫 실사용 TTFT 정상" ) &
+
 launch_tabby

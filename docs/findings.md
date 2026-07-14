@@ -61,7 +61,48 @@ The one MoE that beat the default on speed/VRAM got the full gauntlet (thinking 
 multi-file refactors in one shot, where the general Qwen3.6 needs slow thinking. **Default stays
 Qwen3-Coder-30B**; Qwen3.6-35B is kept as a validated alternative (`./setup-exl3.sh d-qwen36-35b`).
 
+## 5. Ornith-1.0-35B — hybrid attention unlocks 128K on 16 GB → promoted to daily coder
+
+The multi-agent use case kept hitting a wall: Qwen3-Coder-30B's full attention (48 layers) blows the
+KV budget at ~48–96 K tokens. **Ornith-1.0-35B** (Qwen3.5-35B-A3B agentic-coding MoE, MIT) uses
+**hybrid attention** — of 40 layers only 10 are full-attention, the rest linear (constant KV). We
+converted it locally to EXL3 3.08 bpw (`convert-ornith-exl3.sh`; no community EXL3 exists).
+
+| Metric (16 GB, EXL3 3 bpw, Q4 KV) | Ornith-35B | Qwen3-Coder-30B |
+|---|---|---|
+| Max context that loads | **~224 K** | ~48–96 K |
+| Needle-recall @115 K (depths 10/50/90 %) | **3/3 PASS** | can't fit |
+| Decode | 126–147 tok/s | ~115 tok/s |
+| **Warm** TTFT | **0.08–0.19 s** | ~0.25 s |
+| Hard-coding 6 (thinking-OFF + code system prompt) | 5/6 | 6/6 |
+| Hard-coding 6 (thinking-ON) | **6/6** | — |
+
+Two gotchas worth their own line:
+- **The "3.4 s TTFT" that almost buried Ornith was a benchmark artifact** — the first inference after
+  load pays a one-time cudagraph/kernel warm-up. Discard the first call (or warm it) and TTFT is
+  ~0.1 s. `start-tabby-server.sh` now fires a background warm-up request after load, so the first
+  *real* request is fast (helps every model, not just Ornith).
+- **Don't budget the reasoning.** thinking-ON hits 6/6; telling it to "think briefly" drops it to
+  4/6. It's binary (`enable_thinking` true/false) — half-thinking is worse than none.
+
+**Decision:** Ornith is now the `gpu` default, run in **two modes** — `enable_thinking:false` for fast
+interactive coding (0.1 s TTFT, 128 K context, 5/6), flip to `true` for the hard/critical ones (6/6).
+Qwen3-Coder-30B stays a one-command fallback (`./setup-exl3.sh a-safe`) — it still wins "hard problem,
+*fast*, first try" (6/6 with no thinking). Setup: `./setup-exl3.sh e-ornith && ./start-tabby-server.sh`.
+
+## 6. gemma-4 NVFP4 (Unsloth) — only the 12B fits, and it's beaten here
+
+Checked Unsloth's gemma-4 NVFP4 line for the same KV/long-context goal. On 16 GB only **gemma-4-12b**
+(9.3 GB) fits — 31B (24.8 GB) and 26B-A4B (16.9 GB) don't. Measured 12B on vLLM: **128 K loads at
+14.4 GB, 74 tok/s, needle-recall 3/3 @119 K** (its 5:1 sliding/global attention makes KV cheap, like
+Ornith). But it's **slower (74 vs 126 tok/s), a general non-coding model, and locked to the
+high-effort vLLM/sm_120 path** — and the long-context win is already banked by Ornith in the native
+EXL3 stack. **Skipped** for coding; only a candidate if you specifically want a fast multimodal
+long-context assistant.
+
 ## Takeaway
 
-For coding on a 16 GB RTX 5080: a **low-active-param MoE at EXL3 3-bit** is the sweet spot — fast,
-fits, and (for a coding-specialized model) beats bigger/newer general models on the hardest tasks.
+For coding on a 16 GB RTX 5080: a **low-active-param MoE at EXL3 3-bit** is the sweet spot. A
+coding-*specialized* model (Qwen3-Coder-30B) wins "hard + fast + first try"; a **hybrid-attention**
+model (Ornith-35B) trades a hair of fast-mode accuracy for **4–5× the context (128 K+ on 16 GB)** and
+equal speed — which is why it's the current default, with the specialist one command away.
