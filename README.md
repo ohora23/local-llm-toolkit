@@ -38,6 +38,12 @@ All OpenAI-compatible on `127.0.0.1`. GPU-heavy ones are mutually exclusive (the
 | `hyb` | 5002 | ik_llama.cpp | Mistral-Small-4-119B (Q4) | big-brain / reasoning, GPU+CPU MoE offload (~25 tok/s) |
 | `ko` | 5003 | llama.cpp (GPU) | **Kanana-2-30B** (GGUF) | native Korean |
 
+The `gpu` slot has validated **swap-in alternatives** (mutually exclusive — one GPU model at a time):
+Qwen3-Coder-30B (`./setup-exl3.sh a-safe`, the fast-hard-problem fallback), Qwen3.6-35B-A3B
+(`d-qwen36`), and **Bonsai-27B** — a ternary (1.71-bit) Qwen3.6-27B on a llama.cpp fork that fits
+**262 K context on 16 GB** and adds vision (`./start-bonsai-server.sh`, `SPECULATIVE=1` → 148 t/s).
+See [docs/findings.md](docs/findings.md) for the head-to-heads.
+
 ## Quickstart
 
 ```bash
@@ -63,8 +69,9 @@ GUI: `cargo build --release --manifest-path llm-panel-rs/Cargo.toml` then run
 - **[docs/setup.md](docs/setup.md)** — prerequisites & how to build each engine (the real work).
 - **[docs/how-to.md](docs/how-to.md)** — full usage: endpoints, profiles, CPU/hybrid/Korean, Ollama, troubleshooting.
 - **[docs/findings.md](docs/findings.md)** — measured experiments behind the defaults: speculative
-  decoding (helps dense, hurts MoE), NVFP4 on Blackwell, EXL3 low-bit model comparisons, and why
-  Qwen3-Coder-30B stays the default coder.
+  decoding (helps dense, hurts MoE), NVFP4 on Blackwell, EXL3 low-bit comparisons, the Ornith-35B
+  hybrid-attention coder (now the default) + tool-call temperature fix, and the Bonsai-27B ternary
+  head-to-head.
 
 ## Models
 

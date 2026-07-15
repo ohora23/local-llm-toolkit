@@ -53,3 +53,6 @@ agent/browser-output/
 
 # superseded by docs/how-to.md (English)
 HOW-TO-USE.md
+
+# Bonsai eval — vendored fork repo + ~9GB models + prebuilt binaries (re-fetch via start-bonsai-server.sh header)
+bonsai-eval/

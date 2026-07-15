@@ -119,6 +119,37 @@ send any temperature; the server clamps it. With that, the agent completed the t
 the bug, edited the source, ran the tests, all 5 passed. Low temperature is the right default for a
 coding/tool-use driver anyway.
 
+## 8. Bonsai-27B (ternary / 1.71-bit) — extreme low-bit that actually works
+
+Prior verdict on extreme quantization (BitNet-style) was "no payoff on this GPU." **Bonsai-27B**
+(PrismML) forces a revisit: it's **Qwen3.6-27B quantized to ternary {−1,0,+1} at 1.71 bpw**, on a
+llama.cpp fork (`Q2_0_g128` hybrid-attention CUDA kernels; prebuilt binaries include `sm_120a`).
+Measured on the RTX 5080:
+
+| Metric | Bonsai-27B ternary | Ornith-35B (daily) |
+|---|---|---|
+| Weights on disk | **6.66 GB** | 14.4 GB |
+| Decode | 82 t/s → **148 t/s** with the dspark drafter (code, temp 0, ~0.7 accept) | ~130 t/s |
+| Prefill (pp512) | 2199 t/s | — |
+| Hard-coding 6 (thinking-OFF) | 4/6 | 5/6 |
+| Hard-coding 6 (thinking-ON) | 6/6 (~38 s/problem — slow) | 6/6 (~10 s) |
+| Max context on 16 GB | **262 K** (13.4 GB, 4-bit KV) / 128 K = 10.5 GB | 224 K |
+| Vision | ✅ (mmproj) | ✗ |
+
+Published scores back the quality: HumanEval+ 93.9 (vs 95.1 FP16), LiveCodeBench 82.75 — ternary
+barely dented coding. And it runs **native on Blackwell sm_120** out of the box.
+
+**Verdict: keep it as a specialist, not the daily.** Ornith still wins interactive coding (faster
+thinking, 5/6 fast mode, already integrated + tool-calls solved). Bonsai's edges are **ultra-long
+context (262 K on 16 GB, its 6.66 GB weights leave huge KV room) and vision** — the model to reach for
+on >224 K or multimodal work. It needs the PrismML fork today; once the `Q2_0` CUDA path merges
+upstream ([llama.cpp#25707](https://github.com/ggml-org/llama.cpp/pull/25707)) the fork goes away.
+Run it with `./start-bonsai-server.sh` (`SPECULATIVE=1` for the 1.8× decode, `KV4=1 BONSAI_CTX=262144`
+for full context).
+
+_(Also checked: **SuperGemma4** — Gemma-4-26B, MLX-only + no working GGUF → not runnable on NVIDIA,
+skipped. **Google LiteRT-LM** — an edge/mobile engine, no CUDA server story → for Jetson, not this box.)_
+
 ## Takeaway
 
 For coding on a 16 GB RTX 5080: a **low-active-param MoE at EXL3 3-bit** is the sweet spot. A
