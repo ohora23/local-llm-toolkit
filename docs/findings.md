@@ -100,6 +100,25 @@ high-effort vLLM/sm_120 path** — and the long-context win is already banked by
 EXL3 stack. **Skipped** for coding; only a candidate if you specifically want a fast multimodal
 long-context assistant.
 
+## 7. Multi-agent on Ornith — context wall gone, but temperature breaks tool calls at high context
+
+Wired Ornith (128 K) in as the driver agent (opencode/sisyphus) on a real multi-file bug-fix task.
+The historical blocker — driver context blowing past the KV budget — is **gone**: the session ran at
+**78 K tokens** with no context-limit errors (exactly where Qwen3-Coder died at ~48 K). But two new
+failure modes showed up, both fixable:
+
+- **High context + thinking-ON degenerates** into token salad on the 3.08 bpw quant. Fix: default
+  `enable_thinking` to *off* in the chat template (explicit `true` still opts in).
+- **High context + high temperature corrupts tool-call arguments** (garbled paths, wrong keys).
+  Measured cleanly: at 78 K, `temp ≤ 0.4` → perfect tool calls; `temp ≥ 0.7` → breakage. It's the
+  sampling randomness over a low-bit model at depth, not the KV cache or context length.
+
+Fix that stuck: a TabbyAPI **server-side sampler override forcing `temperature: 0.2`** (`force: true`),
+shipped as the `coder` preset (`e-ornith.sh` writes it, `setup-exl3.sh e-ornith` wires it). Clients can
+send any temperature; the server clamps it. With that, the agent completed the task end-to-end — found
+the bug, edited the source, ran the tests, all 5 passed. Low temperature is the right default for a
+coding/tool-use driver anyway.
+
 ## Takeaway
 
 For coding on a 16 GB RTX 5080: a **low-active-param MoE at EXL3 3-bit** is the sweet spot. A

@@ -141,7 +141,7 @@ download_exl3_model() {
 # ── config.yml 생성 ─────────────────────────────────────────────────
 # write_tabby_config MODEL_SUBDIR MAX_SEQ_LEN CACHE_MODE
 write_tabby_config() {
-  local model_subdir="$1" max_seq_len="$2" cache_mode="$3"
+  local model_subdir="$1" max_seq_len="$2" cache_mode="$3" sampler_preset="${4:-}"
   local cfg="$TABBY_DIR/config.yml"
 
   cat > "$cfg" <<EOF
@@ -161,13 +161,13 @@ model:
   tool_format: qwen3_coder   # Qwen3-Coder 툴콜(<tool_call><function=…>)을 OpenAI tool_calls로 파싱 → Goose 등 에이전트 동작
 
 sampling:
-  override_preset:
+  override_preset: $sampler_preset
 
 developer:
   unsafe_launch: false
 EOF
   echo "[setup] config.yml 작성: $cfg"
-  echo "        model=$model_subdir  ctx=$max_seq_len  cache=$cache_mode"
+  echo "        model=$model_subdir  ctx=$max_seq_len  cache=$cache_mode${sampler_preset:+  sampler=$sampler_preset}"
 }
 
 # ── 서버 기동 ───────────────────────────────────────────────────────

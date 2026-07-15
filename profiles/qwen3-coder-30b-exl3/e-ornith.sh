@@ -23,7 +23,24 @@ if [ ! -f "$SCRIPT_DIR/../../exl3/models/$SUBDIR/config.json" ]; then
   exit 1
 fi
 download_exl3_model "$REPO" "$REVISION" "$SUBDIR"   # config.json 있으면 즉시 스킵
-write_tabby_config "$SUBDIR" "$MAX_SEQ_LEN" "$CACHE_MODE"
+
+# 코딩/에이전트용 강제 샘플링 프리셋(멱등 생성). 고컨텍스트에서 높은 temp가 3bpw 양자화와 겹쳐
+# 툴콜 인자·출력이 깨지는 문제 방지(실측: temp≤0.4 안전, ≥0.7 붕괴). force로 클라이언트 값 무시.
+SAMPLER_PRESET="${SAMPLER_PRESET:-coder}"
+if [ -n "$SAMPLER_PRESET" ]; then
+  mkdir -p "$TABBY_DIR/sampler_overrides"
+  cat > "$TABBY_DIR/sampler_overrides/$SAMPLER_PRESET.yml" <<'YML'
+# Ornith 코딩/에이전트 드라이버용 강제 샘플링. 고컨텍스트 툴콜 붕괴 방지(temp 클램프).
+temperature:
+  override: 0.2
+  force: true
+top_p:
+  override: 0.9
+  force: true
+YML
+  echo "[setup] sampler override: $SAMPLER_PRESET (temp 0.2 force)"
+fi
+write_tabby_config "$SUBDIR" "$MAX_SEQ_LEN" "$CACHE_MODE" "$SAMPLER_PRESET"
 
 echo ""
 echo "[done] Ornith 셋업 완료. 서버 기동:  ./start-tabby-server.sh"
