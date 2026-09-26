@@ -21,7 +21,8 @@
 #    llm restart [gpu|cpu|hyb|ko|both]  down then up
 #    llm status                       engines/ports/models/VRAM/RAM/CPU at a glance
 #    llm models                       /v1/models of all endpoints
-#    llm ask "prompt" [--cpu|--gpu|--hyb|--ko]   one-shot query (default: whatever is up)
+#    llm ask "prompt" [--cpu|--gpu|--hyb|--ko|--hrvl|--hermes] [--fast]   one-shot (default: whatever is up)
+#        --fast = thinking OFF (chat_template_kwargs enable_thinking:false) — 요약/번역/분류 등 단발 텍스트용, 7.8s→1.0s
 #    llm chat [--cpu|--gpu|--hyb|--ko]   interactive chat REPL
 #    llm switch <a-moe|a-moe-q8|b-light>   switch CPU profile (restart if running)
 #    llm bench [gpu|cpu|hyb]          speed benchmark
@@ -328,18 +329,20 @@ _target() {  # parse --cpu/--gpu/--hyb -> echo "host port"
   esac
 }
 cmd_ask() {
-  local prompt="" tgt="auto" a
+  local prompt="" tgt="auto" fast=0 a
   for a in "$@"; do
-    case "$a" in --cpu) tgt=cpu;; --gpu) tgt=gpu;; --hyb) tgt=hyb;; --ko) tgt=ko;; --hrvl) tgt=hrvl;; --hermes) tgt=hermes;; *) prompt="$a";; esac
+    case "$a" in --cpu) tgt=cpu;; --gpu) tgt=gpu;; --hyb) tgt=hyb;; --ko) tgt=ko;; --hrvl) tgt=hrvl;; --hermes) tgt=hermes;; --fast) fast=1;; *) prompt="$a";; esac
   done
-  [ -n "$prompt" ] || { _err 'llm ask "prompt" [--cpu|--gpu|--hyb|--ko|--hrvl|--hermes]'; return 1; }
+  [ -n "$prompt" ] || { _err 'llm ask "prompt" [--cpu|--gpu|--hyb|--ko|--hrvl|--hermes] [--fast]'; return 1; }
   read -r host port < <(_target "$tgt")
   _reachable "$host" "$port" || { _err "$tgt endpoint not up ($host:$port). First: llm up $tgt (remote: check its own service)"; return 1; }
-  HOST="$host" PORT="$port" PROMPT="$prompt" python3 - <<'PY'
+  HOST="$host" PORT="$port" PROMPT="$prompt" FAST="$fast" python3 - <<'PY'
 import os, json, urllib.request
 host,port,prompt=os.environ["HOST"],os.environ["PORT"],os.environ["PROMPT"]
-body=json.dumps({"model":"local","messages":[{"role":"user","content":prompt}],
-                 "temperature":0.3,"stream":True}).encode()
+body={"model":"local","messages":[{"role":"user","content":prompt}],"temperature":0.3,"stream":True}
+# --fast: hybrid-thinking models (Qwen3.6/Ornith) only honour chat_template_kwargs; reasoning_effort is ignored
+if os.environ.get("FAST")=="1": body["chat_template_kwargs"]={"enable_thinking":False}
+body=json.dumps(body).encode()
 req=urllib.request.Request(f"http://{host}:{port}/v1/chat/completions",data=body,
                            headers={"Content-Type":"application/json"})
 with urllib.request.urlopen(req) as r:
