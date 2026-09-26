@@ -44,6 +44,14 @@ Qwen3-Coder-30B (`./setup-exl3.sh a-safe`, the fast-hard-problem fallback), Qwen
 **262 K context on 16 GB** and adds vision (`./start-bonsai-server.sh`, `SPECULATIVE=1` → 148 t/s).
 See [docs/findings.md](docs/findings.md) for the head-to-heads.
 
+## Remote endpoints (read-only)
+
+`llm status` also shows two LAN boxes it does not manage: **`hrvl`** (hrvl-server.local:8080, AMD R9700 32 GB,
+Qwen3.6-35B-A3B, 2×64 K slots) and **`hermes`** (Jetson Xavier head via `head-llm-tunnel.service`, :9999).
+`llm ask/chat --hrvl|--hermes` talk to them; start/stop belongs to their own systemd units.
+`oc-run.sh [-C dir] [-c] "task"` delegates an agentic coding task to opencode running fully local on `hrvl`
+(no cloud provider) and prints the resulting `git diff --stat` — the hand-off used by Claude Code.
+
 ## Quickstart
 
 ```bash
