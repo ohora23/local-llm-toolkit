@@ -85,6 +85,20 @@ _wait_ready() {
   return 1
 }
 
+# hyb only: the port opens before the ~58GB of CPU experts are resident.
+# Wait until the server's RSS reaches $2 GB so "ready" means "really in RAM".
+_wait_resident() {
+  local port="$1" need="$2" tries="${3:-360}" pid rss i
+  for ((i=1; i<=tries; i++)); do
+    pid=$(ss -ltnpH "( sport = :$port )" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)
+    [ -n "$pid" ] || return 1
+    rss=$(awk '/^VmRSS:/{print int($2/1048576)}' "/proc/$pid/status" 2>/dev/null || echo 0)
+    [ "${rss:-0}" -ge "${need%.*}" ] && return 0
+    sleep 2
+  done
+  return 1
+}
+
 # ── start ───────────────────────────────────────────────────────────
 # stop a conflicting server if it's up (mutual exclusion)
 _stop_conflict() {  # name host port reason
@@ -133,7 +147,7 @@ _up_hyb() {
   _stop_conflict "$KO_NAME"  "$KO_HOST"  "$KO_PORT"  hyb
   _info "starting $HYB_NAME ... (loads ~74GB, ~2-3 min, log: $HYB_LOG)"
   ( cd "$ROOT" && nohup ./start-hyb-server.sh >"$HYB_LOG" 2>&1 & )
-  if _wait_ready "$HYB_HOST" "$HYB_PORT" 360; then
+  if _wait_ready "$HYB_HOST" "$HYB_PORT" 360 && _wait_resident "$HYB_PORT" "${HYB_READY_RSS_GB:-50}" 360; then
     _ok "$HYB_NAME ready -> http://$HYB_HOST:$HYB_PORT/v1  (model: $(_model_id $HYB_HOST $HYB_PORT))"
   else
     _err "$HYB_NAME failed/slow to start. Check: llm logs hyb"; return 1
@@ -206,8 +220,10 @@ cmd_status() {
 
 # JSON status for GUI/scripts (single psutil pass)
 cmd_json_status() {
+  local hyb_model="${HYB_MODEL:-${MODEL_STORE:-$HOME/b_Models}/Mistral-Small-4-119B-Q4_K_XL/UD-Q4_K_XL/Mistral-Small-4-119B-2603-UD-Q4_K_XL-00001-of-00003.gguf}"
   GPU_HOST="$GPU_HOST" GPU_PORT="$GPU_PORT" CPU_HOST="$CPU_HOST" CPU_PORT="$CPU_PORT" \
   HYB_HOST="$HYB_HOST" HYB_PORT="$HYB_PORT" KO_HOST="$KO_HOST" KO_PORT="$KO_PORT" \
+  HYB_MODEL="$hyb_model" HYB_READY_RSS_GB="${HYB_READY_RSS_GB:-50}" \
   WEBUI_HOST="$WEBUI_HOST" WEBUI_PORT="$WEBUI_PORT" WEBUI_URL="$WEBUI_URL" \
   python3 - <<'PY'
 import json, os, subprocess, urllib.request
@@ -230,6 +246,14 @@ def http_ok(url):
             return 200 <= r.status < 400
     except Exception:
         return False
+def rss_gb(pid):
+    # resident bytes of the server process — the only signal that says
+    # "weights are really in RAM" under BOTH mmap and --no-mmap.
+    try:
+        for ln in open(f"/proc/{pid}/status"):
+            if ln.startswith("VmRSS:"): return int(ln.split()[1])/1048576.0
+    except Exception: pass
+    return 0.0
 def pid_on(port):
     try:
         out=subprocess.run(["ss","-ltnpH",f"( sport = :{port} )"],capture_output=True,text=True,timeout=3).stdout
@@ -250,13 +274,23 @@ try:
     gpu=dict(vram_used_mb=float(vu), vram_total_mb=float(vt), util=float(gu), temp=float(gt))
 except Exception: pass
 g=os.environ
+# hyb: port answers /v1/models the moment the server binds, but the ~58 GB of
+# CPU-side experts land in RAM after that -> gate "up" on resident size.
+hyb_pid=pid_on(int(g["HYB_PORT"]))
+hyb_model=reach(g["HYB_HOST"],int(g["HYB_PORT"]))
+hyb_rss=rss_gb(hyb_pid) if hyb_pid else 0.0
+# ponytail: fixed threshold, tune HYB_READY_RSS_GB if N_CPU_MOE changes.
+hyb_need=float(os.environ.get("HYB_READY_RSS_GB","50"))
+hyb_ready=bool(hyb_model) and hyb_rss>=hyb_need
 print(json.dumps({
  "gpu_ep":{"name":"GPU EXL3","host":g["GPU_HOST"],"port":int(g["GPU_PORT"]),
            "model":reach(g["GPU_HOST"],int(g["GPU_PORT"])),"pid":pid_on(int(g["GPU_PORT"]))},
  "cpu_ep":{"name":"CPU llama.cpp","host":g["CPU_HOST"],"port":int(g["CPU_PORT"]),
            "model":reach(g["CPU_HOST"],int(g["CPU_PORT"])),"pid":pid_on(int(g["CPU_PORT"]))},
  "hyb_ep":{"name":"Hybrid Mistral-Small-4","host":g["HYB_HOST"],"port":int(g["HYB_PORT"]),
-           "model":reach(g["HYB_HOST"],int(g["HYB_PORT"])),"pid":pid_on(int(g["HYB_PORT"]))},
+           "model":hyb_model,"pid":hyb_pid,
+           "avail":os.path.exists(g.get("HYB_MODEL","")),
+           "rss_gb":round(hyb_rss,1),"need_gb":hyb_need,"ready":hyb_ready},
  "ko_ep":{"name":"Korean Kanana-2","host":g["KO_HOST"],"port":int(g["KO_PORT"]),
            "model":reach(g["KO_HOST"],int(g["KO_PORT"])),"pid":pid_on(int(g["KO_PORT"]))},
  "webui_ep":{"name":"Open WebUI","host":g["WEBUI_HOST"],"port":int(g["WEBUI_PORT"]),

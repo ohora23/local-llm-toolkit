@@ -65,6 +65,10 @@ struct Status {
     cpu_pid: Option<i64>,
     hyb_model: Option<String>,
     hyb_pid: Option<i64>,
+    hyb_avail: bool,
+    hyb_ready: bool,
+    hyb_rss: f64,
+    hyb_need: f64,
     ko_model: Option<String>,
     ko_pid: Option<i64>,
     cpu_pct: f64,
@@ -102,6 +106,12 @@ fn parse_status(v: &Value) -> Status {
     if let Some(ep) = v.get("hyb_ep") {
         s.hyb_model = ep.get("model").and_then(|m| m.as_str()).map(|x| x.to_string());
         s.hyb_pid = ep.get("pid").and_then(|p| p.as_i64());
+        // missing key (older `llm`) → assume available, don't grey out
+        s.hyb_avail = ep.get("avail").and_then(|a| a.as_bool()).unwrap_or(true);
+        // missing key (older `llm`) → assume ready, i.e. old behaviour
+        s.hyb_ready = ep.get("ready").and_then(|a| a.as_bool()).unwrap_or(true);
+        s.hyb_rss = ep.get("rss_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        s.hyb_need = ep.get("need_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
     }
     if let Some(ep) = v.get("ko_ep") {
         s.ko_model = ep.get("model").and_then(|m| m.as_str()).map(|x| x.to_string());
@@ -186,6 +196,16 @@ fn gb(mb: f64) -> f64 {
 }
 
 fn main() {
+    // Single-instance guard: hold a panel-only localhost port for our lifetime.
+    // If bind fails, another llm-panel is already up → don't open a second one.
+    let _instance_guard = match std::net::TcpListener::bind("127.0.0.1:53939") {
+        Ok(l) => l,
+        Err(_) => {
+            eprintln!("llm-panel is already running");
+            return;
+        }
+    };
+
     let app = app::App::default().with_scheme(app::Scheme::Gtk);
     app::background(0x1e, 0x1e, 0x2e);
     app::foreground(0xcd, 0xd6, 0xf4);
@@ -273,14 +293,14 @@ fn main() {
     }
 
     // ── per-side cards ───────────────────────────────────────────────
-    let (mut gpu_led, mut gpu_dot, mut gpu_model) =
+    let (mut gpu_led, mut gpu_dot, mut gpu_model, mut gpu_start, mut gpu_stop) =
         side_card(12, 32, "GPU  -  EXL3 (TabbyAPI)", "gpu", s, shared.clone());
-    let (mut cpu_led, mut cpu_dot, mut cpu_model) =
+    let (mut cpu_led, mut cpu_dot, mut cpu_model, mut cpu_start, mut cpu_stop) =
         side_card(284, 32, "CPU  -  llama.cpp", "cpu", s, shared.clone());
     // exclusive GPU models row: HYB (Mistral-Small-4, hybrid) + KO (Kanana, Korean)
-    let (mut hyb_led, mut hyb_dot, mut hyb_model) =
+    let (mut hyb_led, mut hyb_dot, mut hyb_model, mut hyb_start, mut hyb_stop) =
         side_card(12, 186, "HYB  -  Mistral-Small-4", "hyb", s, shared.clone());
-    let (mut ko_led, mut ko_dot, mut ko_model) =
+    let (mut ko_led, mut ko_dot, mut ko_model, mut ko_start, mut ko_stop) =
         side_card(284, 186, "KO  -  Kanana-2 (KR)", "ko", s, shared.clone());
 
     // ── global controls ──────────────────────────────────────────────
@@ -463,10 +483,33 @@ fn main() {
                     update_ep(&mut cpu_led, &mut cpu_dot, &mut cpu_model, &st.cpu_model, st.cpu_pid);
                     update_ep(&mut hyb_led, &mut hyb_dot, &mut hyb_model, &st.hyb_model, st.hyb_pid);
                     update_ep(&mut ko_led, &mut ko_dot, &mut ko_model, &st.ko_model, st.ko_pid);
+                    // Start/Stop button state: running = reachable or port held.
+                    // gpu/cpu/ko have no on-disk-avail flag → always avail=true.
+                    let run = |m: &Option<String>, pid: Option<i64>| m.is_some() || pid.is_some();
+                    set_ep_buttons(&mut gpu_start, &mut gpu_stop, run(&st.gpu_model, st.gpu_pid), true);
+                    set_ep_buttons(&mut cpu_start, &mut cpu_stop, run(&st.cpu_model, st.cpu_pid), true);
+                    set_ep_buttons(&mut ko_start, &mut ko_stop, run(&st.ko_model, st.ko_pid), true);
+                    let hyb_run = run(&st.hyb_model, st.hyb_pid);
+                    set_ep_buttons(&mut hyb_start, &mut hyb_stop, hyb_run, st.hyb_avail);
+                    // HYB: port answers while the ~58GB of CPU experts are still
+                    // loading → amber "loading", green only once they are resident.
+                    if hyb_run && !st.hyb_ready {
+                        hyb_led.set_color(Color::from_u32(C_WARN));
+                        hyb_dot.set_label(&format!(
+                            "loading  {:.0}/{:.0} GB in RAM", st.hyb_rss, st.hyb_need));
+                        hyb_dot.set_label_color(Color::from_u32(C_WARN));
+                        hyb_led.redraw();
+                    }
+                    // HYB model file deleted → flag it in the card text
+                    if !st.hyb_avail && !hyb_run {
+                        hyb_dot.set_label("no model file");
+                        hyb_dot.set_label_color(Color::from_u32(C_DOWN));
+                        hyb_model.set_label("model: (deleted)");
+                    }
                     // live title strip: distinct-color chips for running servers + CPU/RAM
                     set_chip(&mut chip_gpu, st.gpu_model.is_some(), C_OK);
                     set_chip(&mut chip_cpu, st.cpu_model.is_some(), C_WARN);
-                    set_chip(&mut chip_hyb, st.hyb_model.is_some(), C_ACC);
+                    set_chip(&mut chip_hyb, st.hyb_model.is_some() && st.hyb_ready, C_ACC);
                     set_chip(&mut chip_ko, st.ko_model.is_some(), C_KO);
                     lbl_cpu.set_label(&format!("CPU {:.0}%", st.cpu_pct));
                     lbl_cpu.set_label_color(Color::from_u32(load_color(st.cpu_pct)));
@@ -522,7 +565,7 @@ fn side_card(
     side: &'static str,
     s: app::Sender<Msg>,
     _shared: Rc<RefCell<Status>>,
-) -> (Frame, Frame, Frame) {
+) -> (Frame, Frame, Frame, Button, Button) {
     let w = 264;
     let mut bg = Frame::new(x, y, w, 150, None);
     bg.set_frame(FrameType::FlatBox);
@@ -554,10 +597,10 @@ fn side_card(
     model.set_align(Align::Left | Align::Inside);
 
     let bw = 114;
-    btn(x + 12, y + 82, bw, "Start", C_OK, {
+    let start_btn = btn(x + 12, y + 82, bw, "Start", C_OK, {
         let s = s; let side = side; move |_| run_async(s, vec!["up".into(), side.into()])
     });
-    btn(x + 12 + bw + 12, y + 82, bw, "Stop", C_DOWN, {
+    let stop_btn = btn(x + 12 + bw + 12, y + 82, bw, "Stop", C_DOWN, {
         let s = s; let side = side; move |_| run_async(s, vec!["down".into(), side.into()])
     });
     btn(x + 12, y + 116, bw, "Bench", C_CARD, {
@@ -567,7 +610,7 @@ fn side_card(
         let side = side; move |_| { open_terminal(&["logs", side]); }
     });
 
-    (led, dot, model)
+    (led, dot, model, start_btn, stop_btn)
 }
 
 // ── title-strip widgets (bold, individually colored) ─────────────────
@@ -722,6 +765,16 @@ fn vram_graph(x: i32, y: i32, w: i32, h: i32, hist: Rc<RefCell<VramHist>>) -> Fr
     f
 }
 
+// Start enabled only when down + model present; Stop enabled only when running.
+// Each endpoint is judged from its OWN running/avail state (per-model, not shared).
+// redraw() is required — activate/deactivate alone don't repaint the widget.
+fn set_ep_buttons(start: &mut Button, stop: &mut Button, running: bool, avail: bool) {
+    if !running && avail { start.activate(); } else { start.deactivate(); }
+    if running { stop.activate(); } else { stop.deactivate(); }
+    start.redraw();
+    stop.redraw();
+}
+
 fn update_ep(led: &mut Frame, dot: &mut Frame, model: &mut Frame, m: &Option<String>, pid: Option<i64>) {
     match m {
         Some(name) => {
@@ -740,7 +793,7 @@ fn update_ep(led: &mut Frame, dot: &mut Frame, model: &mut Frame, m: &Option<Str
     led.redraw();
 }
 
-fn btn<F: FnMut(&mut Button) + 'static>(x: i32, y: i32, w: i32, label: &str, bg: u32, cb: F) {
+fn btn<F: FnMut(&mut Button) + 'static>(x: i32, y: i32, w: i32, label: &str, bg: u32, cb: F) -> Button {
     let mut b = Button::new(x, y, w, 30, None);
     b.set_label(label);
     b.set_frame(FrameType::FlatBox);
@@ -749,4 +802,5 @@ fn btn<F: FnMut(&mut Button) + 'static>(x: i32, y: i32, w: i32, label: &str, bg:
     b.set_label_font(Font::HelveticaBold);
     b.set_label_size(14);
     b.set_callback(cb);
+    b
 }

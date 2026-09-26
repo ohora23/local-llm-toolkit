@@ -147,8 +147,100 @@ upstream ([llama.cpp#25707](https://github.com/ggml-org/llama.cpp/pull/25707)) t
 Run it with `./start-bonsai-server.sh` (`SPECULATIVE=1` for the 1.8× decode, `KV4=1 BONSAI_CTX=262144`
 for full context).
 
-_(Also checked: **SuperGemma4** — Gemma-4-26B, MLX-only + no working GGUF → not runnable on NVIDIA,
-skipped. **Google LiteRT-LM** — an edge/mobile engine, no CUDA server story → for Jetson, not this box.)_
+_(Also checked, both skipped — see §11 for the re-check that corrected the original reasons:
+**SuperGemma4** (uncensored Gemma-4-26B) and **Google LiteRT-LM** (edge/mobile engine).)_
+
+## 9. "Fable" MoE-offload prefetch fork — real, but the free `-ub` knob does most of it
+
+A llama.cpp fork ([`thecodacus/llama.cpp` @ `fable5/prefetch-experts`](https://github.com/thecodacus/llama.cpp/tree/fable5/prefetch-experts))
+adds two **opt-in** env-var optimizations for MoE models whose experts are offloaded to system RAM
+(`--n-cpu-moe`): `GGML_CUDA_REGISTER_HOST=1` pins the mmap'd expert pages so H2D copies go over DMA,
+and `GGML_SCHED_PREFETCH_EXPERTS=1` uploads each layer's experts on a second CUDA stream to overlap
+compute. Author reports **+64% prefill** on an RTX 3060. Only one endpoint here qualifies — **`ko`
+(Kanana-2-30B-A3B)**; `hyb` runs ik_llama.cpp (patch doesn't apply), `gpu` is EXL3, `cpu` has no H2D.
+
+`llama-bench`, Kanana Q4_K_M, `-ncmoe 18`, `-ub 2048`, r=3:
+
+| Config | pp2048 (t/s) |
+|---|---:|
+| baseline | 2891.8 ± 77.1 |
+| `REGISTER_HOST` (pinning only) | 2885.4 ± 79.1 — **no effect** |
+| `PREFETCH_EXPERTS` only | 3612.4 ± 10.4 (**+24.9%**) |
+| both | 3659.2 ± 54.1 (+26.5%) |
+
+All the gain is prefetch; pinning contributes nothing measurable on this box (faster GPU/PCIe than a
+3060 → less H2D stall to hide). **But it inverts on the real server**, because the fork's benchmark
+uses `-ub 2048` while `llama-server` defaults to **512**. Live server, 9,125-token prefill, r=3:
+
+| Config | prefill | VRAM |
+|---|---:|---:|
+| `-ub 512` (stock server default) | 6.09 s | 14,063 MiB |
+| `-ub 512` + prefetch | **7.44 s — 22% *slower*** | 14,061 MiB |
+| `-ub 2048` | 3.91 s (−36%) | 14,250 MiB |
+| `-ub 2048` + prefetch | 3.57 s (−41%) | 14,254 MiB |
+
+Output was token-identical across all four. **Lesson: at the default ubatch there isn't enough compute
+per step to hide the upload behind, so the prefetch machinery is pure overhead.** The big, free win is
+`-b/-ub 2048` on stock mainline (−36%); the fork adds only **+9%** on top of that and costs a
+maintained fork build, for a non-daily endpoint. **Not adopted** — worth revisiting if it lands
+upstream. (The `-ub` bump wasn't applied either, pending a decision on the `ko` profile.)
+
+## 10. Bonsai ternary on the **CPU** endpoint — the one place it's catastrophically wrong
+
+Bonsai-27B's 6.66 GB weights make it tempting for the CPU helper too. It's the opposite: on CPU the
+cost per token is **bytes read**, and Bonsai is **dense** — every token touches all 27 B params
+(~7 GB), where a low-active-param MoE touches ~3 B. Measured with one binary for all three
+(the PrismML fork's `llama-bench`, `-ngl 0 -t 8`, r=2, so the comparison is apples-to-apples):
+
+| CPU-only model | Size | pp256 (t/s) | tg32 (t/s) |
+|---|---:|---:|---:|
+| Qwen3-4B-Instruct Q4_K_M (current `cpu` default) | 2.32 GiB | 1635.6 ± 44.9 | 20.5 ± 0.1 |
+| Qwen3-Coder-30B-A3B Q4_K_M (MoE, 3 B active) | 17.28 GiB | 341.5 ± 9.1 | **24.1 ± 0.8** |
+| **Bonsai-27B ternary Q2_0** | 6.66 GiB | 414.9 ± 84.0 | **1.05 ± 0.01** |
+
+**Bonsai decodes at 1.05 t/s — 23× slower than either alternative**, and slower than a *dense Q5_K_M
+32B* on the same CPU (2.3 t/s, §1). Pure bandwidth would predict ~7 t/s, so the ternary `Q2_0` path
+has **no optimized CPU kernel** — the fork ships `bin/cuda` only, and the win is GPU-kernel-bound.
+**Verdict: never put Bonsai on the CPU endpoint.** Its small weights buy VRAM headroom, not CPU speed;
+those are different currencies.
+
+Side finding from the same run: **the MoE actually beats the small dense model on CPU decode**
+(24.1 vs 20.5 t/s) despite being 7× larger on disk — active params, not file size, set decode speed.
+Qwen3-Coder-30B-A3B costs 17 GB RAM and ~5× slower prefill, but is a far stronger model at *better*
+decode. (`README.md` still lists 30B-A3B as the `cpu` default while `cpu/active.env` has drifted to
+Qwen3-4B — worth reconciling deliberately rather than by accident.)
+
+## 11. Two re-checks — where the *reason* for skipping was wrong even though the verdict held
+
+Both were dismissed earlier on grounds that turned out to be stale or unverified. Re-checked; both
+stay skipped, but for measured reasons now.
+
+**SuperGemma4** (uncensored/abliterated Gemma-4). Original reason — "MLX-only, no GGUF → can't run on
+NVIDIA" — is **no longer true**: GGUFs exist (`supergemma4-26b-uncensored-gguf-v2` Q4_K_M **16.80 GB**,
+`SuperGemma4-31b-abliterated-GGUF` **18.69 GB**). It runs. It still loses:
+
+- **Doesn't fit.** Both exceed the 15.83 GiB usable — the *weights alone* overflow, leaving no room for
+  KV. Offloading experts to RAM works but trades away the speed that was the selling point.
+- **The speed claim is from other hardware.** "46.2 tok/s / +8.7%" is Apple-Silicon MLX. Measured here,
+  gemma-4-12b hits **74 tok/s** (§6) — already below Ornith's ~130 at a third the size. A 26B with
+  offload lands lower still.
+- **"+8.7% faster" is architecturally impossible.** Abliteration changes neither parameter count nor
+  architecture, so a same-size finetune cannot be faster. That number is measurement error or a
+  different quant. ("Quickbench 95.8" is likewise self-reported, not a standard benchmark.)
+- The base is a general, non-coding Gemma-4 (already skipped in §6), and what SuperGemma4 actually
+  changes — censorship — has near-zero value for a coding driver.
+
+**Google LiteRT-LM.** Desktop support has grown (v0.11 Windows, v0.12 full CPU+GPU on Linux/macOS/
+Windows), so "mobile-only" no longer holds. But **no CUDA anywhere** in the README, release notes, or
+docs — the GPU path is the OpenCL/Vulkan delegate lineage, which on a 5080 means giving up the
+tensor-core/`sm_120` kernels EXL3 and llama.cpp-CUDA rely on. Decisive point is weight class: the
+`.litertlm` ecosystem tops out around **4 B** (functiongemma-270m, Gemma 3n E2B/E4B, gemma-4 E-series,
+medgemma-4B). It cannot run a 35B-A3B at 128 K at all — there's no conversion path. It optimizes
+memory, battery, NPU, and portability, not throughput. Still the right engine for a Jetson, not this box.
+
+**Transferable rule:** three recent candidates (these two plus the §9 fork) all advertised gains
+measured on *other hardware* or under *non-default flags*. Check, in order: (1) what hardware produced
+the number, (2) does it fit 16 GB, (3) is the claimed improvement architecturally possible at all.
 
 ## Takeaway
 
