@@ -13,6 +13,8 @@
 #  remote (read-only here: status/ask/chat/models — start/stop on their own box)
 #    hrvl   hrvl-server.local:8080  Qwen3.6-35B-A3B on AMD R9700 32GB (Vulkan, ~106 tok/s, 2x64K slots)
 #    hermes 127.0.0.1:9999          Jetson Xavier head via head-llm-tunnel.service (~14 tok/s)
+#    llm hrvl [status|connect|disconnect]   attach/detach hrvl to this PC. detach = flag ~/.local/state/llm/hrvl-detached
+#        (ask --hrvl / oc-run.sh refuse with exit 3) + hrvl switched back to its local mode (needs hrvl-mode on hrvl).
 #         ⚠ gpu·hyb·ko 는 VRAM 이 겹쳐 동시구동 불가 — 셋 중 택1. (gpu+cpu 만 공존)
 #
 #  Usage:
@@ -46,6 +48,9 @@ KO_HOST=127.0.0.1;  KO_PORT="${KO_PORT:-5003}";  KO_LOG="$LOGDIR/kanana.log"
 # ponytail: remote LAN endpoints are status/ask only — no up/down (their own systemd units own them)
 HRVL_HOST="${HRVL_HOST:-hrvl-server.local}"; HRVL_PORT="${HRVL_PORT:-8080}"
 HERMES_HOST=127.0.0.1; HERMES_PORT="${HERMES_PORT:-9999}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/llm"; mkdir -p "$STATE_DIR"
+HRVL_DETACHED="$STATE_DIR/hrvl-detached"          # exists = this PC released hrvl (Claude works without it)
+HRVL_SSH="${HRVL_SSH:-$HOME/z_Setup/hrvl/hrvl_ssh.sh}"   # sshpass helper; hrvl-mode lives at ~/local_llm/hrvl-mode on hrvl
 GPU_NAME="GPU EXL3/TabbyAPI"; CPU_NAME="CPU llama.cpp"; HYB_NAME="Hybrid Mistral-Small-4"; KO_NAME="Korean Kanana-2"
 HRVL_NAME="hrvl R9700 Qwen3.6"; HERMES_NAME="Hermes Xavier (tunnel)"
 WEBUI_HOST=127.0.0.1; WEBUI_PORT=3000; WEBUI_NAME="Open WebUI"
@@ -237,6 +242,7 @@ cmd_json_status() {
   HYB_HOST="$HYB_HOST" HYB_PORT="$HYB_PORT" KO_HOST="$KO_HOST" KO_PORT="$KO_PORT" \
   HYB_MODEL="$hyb_model" HYB_READY_RSS_GB="${HYB_READY_RSS_GB:-50}" \
   WEBUI_HOST="$WEBUI_HOST" WEBUI_PORT="$WEBUI_PORT" WEBUI_URL="$WEBUI_URL" \
+  HRVL_HOST="$HRVL_HOST" HRVL_PORT="$HRVL_PORT" HRVL_DETACHED="$HRVL_DETACHED" \
   python3 - <<'PY'
 import json, os, subprocess, urllib.request
 def reach(h,p):
@@ -266,6 +272,17 @@ def rss_gb(pid):
             if ln.startswith("VmRSS:"): return int(ln.split()[1])/1048576.0
     except Exception: pass
     return 0.0
+def hrvl():
+    # attach state of the LAN box: up? mode (from slot ctx), busy slots, detached flag
+    det=os.path.exists(os.environ["HRVL_DETACHED"])
+    try:
+        with urllib.request.urlopen(f"http://{os.environ['HRVL_HOST']}:{os.environ['HRVL_PORT']}/slots", timeout=1) as r:
+            sl=json.load(r)
+        ctx=sl[0].get("n_ctx",0) if sl else 0
+        return {"up":True,"np":len(sl),"busy":sum(1 for x in sl if x.get("is_processing")),"ctx":ctx,
+                "mode":"main" if ctx>=100000 else "local","detached":det}
+    except Exception:
+        return {"up":False,"np":0,"busy":0,"ctx":0,"mode":"?","detached":det}
 def pid_on(port):
     try:
         out=subprocess.run(["ss","-ltnpH",f"( sport = :{port} )"],capture_output=True,text=True,timeout=3).stdout
@@ -307,6 +324,7 @@ print(json.dumps({
            "model":reach(g["KO_HOST"],int(g["KO_PORT"])),"pid":pid_on(int(g["KO_PORT"]))},
  "webui_ep":{"name":"Open WebUI","host":g["WEBUI_HOST"],"port":int(g["WEBUI_PORT"]),
            "url":g["WEBUI_URL"],"up":http_ok(g["WEBUI_URL"]+"/")},
+ "hrvl":hrvl(),
  "cpu_pct":cpu,"ram":ram,"gpu":gpu,
 }))
 PY
@@ -334,6 +352,7 @@ cmd_ask() {
     case "$a" in --cpu) tgt=cpu;; --gpu) tgt=gpu;; --hyb) tgt=hyb;; --ko) tgt=ko;; --hrvl) tgt=hrvl;; --hermes) tgt=hermes;; --fast) fast=1;; *) prompt="$a";; esac
   done
   [ -n "$prompt" ] || { _err 'llm ask "prompt" [--cpu|--gpu|--hyb|--ko|--hrvl|--hermes] [--fast]'; return 1; }
+  [ "$tgt" = hrvl ] && [ -f "$HRVL_DETACHED" ] && { _err "hrvl is detached from this PC (llm hrvl connect to re-attach) — do it locally"; return 3; }
   read -r host port < <(_target "$tgt")
   _reachable "$host" "$port" || { _err "$tgt endpoint not up ($host:$port). First: llm up $tgt (remote: check its own service)"; return 1; }
   HOST="$host" PORT="$port" PROMPT="$prompt" FAST="$fast" python3 - <<'PY'
@@ -424,6 +443,43 @@ cmd_webui() {
   esac
 }
 
+# ── hrvl attach/detach ──────────────────────────────────────────────
+# mode is inferred from the slot context: 65536/slot = hrvl local (2x64K + reranker), >=100K = main (2x128K).
+_hrvl_slots_summary() {  # echo "np busy ctx" or nothing
+  curl -s -m 2 "http://$HRVL_HOST:$HRVL_PORT/slots" 2>/dev/null | python3 -c '
+import sys,json
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+print(len(d), sum(1 for x in d if x.get("is_processing")), d[0].get("n_ctx",0) if d else 0)' 2>/dev/null
+}
+_hrvl_remote_mode() {  # $1 = main|local ; no-op (with notice) until hrvl-mode is installed on hrvl
+  [ -x "$HRVL_SSH" ] || { _info "no ssh helper at $HRVL_SSH — flag updated only"; return 0; }
+  if "$HRVL_SSH" 'test -x ~/local_llm/hrvl-mode' >/dev/null 2>&1; then
+    "$HRVL_SSH" "~/local_llm/hrvl-mode $1"
+  else
+    _info "hrvl-mode not installed on hrvl yet — flag updated only, hrvl keeps its current mode"
+  fi
+}
+cmd_hrvl() {
+  case "${1:-status}" in
+    status)
+      local det=0; [ -f "$HRVL_DETACHED" ] && det=1
+      if ! _reachable "$HRVL_HOST" "$HRVL_PORT"; then
+        printf "hrvl: ${c_r}unreachable${c_0} (%s:%s)  detached=%s\n" "$HRVL_HOST" "$HRVL_PORT" "$det"; return 2
+      fi
+      read -r np busy ctx < <(_hrvl_slots_summary) || { np=?; busy=?; ctx=0; }
+      local mode=local; [ "${ctx:-0}" -ge 100000 ] 2>/dev/null && mode=main
+      printf "hrvl: ${c_g}UP${c_0}  mode=%s  slots %s/%s busy  ctx/slot=%sK  detached=%s\n" "$mode" "$busy" "$np" "$(( ${ctx:-0} / 1024 ))" "$det"
+      [ "$det" = 1 ] && return 3 || return 0 ;;
+    connect)    rm -f "$HRVL_DETACHED"; _ok "hrvl attached to this PC (flag cleared)"; _hrvl_remote_mode main ;;
+    disconnect)
+      read -r np busy ctx < <(_hrvl_slots_summary) || busy=0
+      if [ "${busy:-0}" -gt 0 ] && [ "${2:-}" != --force ]; then _err "hrvl has $busy busy slot(s) — wait, or: llm hrvl disconnect --force"; return 1; fi
+      touch "$HRVL_DETACHED"; _ok "hrvl detached (flag set: $HRVL_DETACHED) — Claude/opencode will work locally"; _hrvl_remote_mode local ;;
+    *) _err "llm hrvl [status|connect|disconnect [--force]]"; return 1 ;;
+  esac
+}
+
 # ── dispatch ────────────────────────────────────────────────────────
 case "${1:-status}" in
   up)      case "${2:-both}" in gpu) _up_gpu;; cpu) _up_cpu;; hyb) _up_hyb;; ko) _up_ko;; both) _up_gpu; _up_cpu;; *) _err "up [gpu|cpu|hyb|ko|both]";; esac ;;
@@ -444,6 +500,7 @@ case "${1:-status}" in
   bench)   shift; cmd_bench "$@" ;;
   logs)    shift; cmd_logs "$@" ;;
   webui)   shift; cmd_webui "$@" ;;
+  hrvl)    shift; cmd_hrvl "$@" ;;
   -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) _err "unknown command: $1"; sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

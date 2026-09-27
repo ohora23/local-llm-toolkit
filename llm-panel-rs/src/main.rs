@@ -41,8 +41,8 @@ fn llm() -> &'static str {
 const PROFILES: [&str; 3] = ["a-moe", "a-moe-q8", "b-light"];
 
 const W: i32 = 560;
-const H_BASE: i32 = 656; // height without output console (incl. VRAM history graph)
-const H_FULL: i32 = 856; // height with output console
+const H_BASE: i32 = 712; // height without output console (incl. VRAM history graph)
+const H_FULL: i32 = 912; // height with output console
 
 // colors (Catppuccin Mocha)
 const C_BG: u32 = 0x1e1e2e;
@@ -81,6 +81,12 @@ struct Status {
     vram_total: f64,
     vram_util: f64,
     vram_temp: f64,
+    hrvl_up: bool,
+    hrvl_np: i64,
+    hrvl_busy: i64,
+    hrvl_ctx: i64,
+    hrvl_mode: String,
+    hrvl_detached: bool,
 }
 
 #[derive(Clone)]
@@ -116,6 +122,14 @@ fn parse_status(v: &Value) -> Status {
     if let Some(ep) = v.get("ko_ep") {
         s.ko_model = ep.get("model").and_then(|m| m.as_str()).map(|x| x.to_string());
         s.ko_pid = ep.get("pid").and_then(|p| p.as_i64());
+    }
+    if let Some(h) = v.get("hrvl").filter(|h| !h.is_null()) {
+        s.hrvl_up = h.get("up").and_then(|x| x.as_bool()).unwrap_or(false);
+        s.hrvl_np = h.get("np").and_then(|x| x.as_i64()).unwrap_or(0);
+        s.hrvl_busy = h.get("busy").and_then(|x| x.as_i64()).unwrap_or(0);
+        s.hrvl_ctx = h.get("ctx").and_then(|x| x.as_i64()).unwrap_or(0);
+        s.hrvl_mode = h.get("mode").and_then(|x| x.as_str()).unwrap_or("?").to_string();
+        s.hrvl_detached = h.get("detached").and_then(|x| x.as_bool()).unwrap_or(false);
     }
     s.cpu_pct = v.get("cpu_pct").and_then(|x| x.as_f64()).unwrap_or(0.0);
     if let Some(r) = v.get("ram").filter(|r| !r.is_null()) {
@@ -303,9 +317,14 @@ fn main() {
     let (mut ko_led, mut ko_dot, mut ko_model, mut ko_start, mut ko_stop) =
         side_card(284, 186, "KO  -  Kanana-2 (KR)", "ko", s, shared.clone());
 
+    // ── hrvl strip: LAN box attach state + Disconnect/Reconnect ──────
+    // Disconnect sets ~/.local/state/llm/hrvl-detached (Claude/opencode then work locally)
+    // and asks hrvl to go back to its own mode; Reconnect clears it and asks for main mode.
+    let (mut hrvl_led, mut hrvl_txt, mut hrvl_dis, mut hrvl_con) = hrvl_strip(12, 342, s, shared.clone());
+
     // ── global controls ──────────────────────────────────────────────
-    section_label(12, 342, "Both");
-    let mut y = 364;
+    section_label(12, 398, "Both");
+    let mut y = 420;
     btn(12, y, 130, "Start Both", C_OK, {
         let s = s; move |_| run_async(s, vec!["up".into(), "both".into()])
     });
@@ -483,6 +502,7 @@ fn main() {
                     update_ep(&mut cpu_led, &mut cpu_dot, &mut cpu_model, &st.cpu_model, st.cpu_pid);
                     update_ep(&mut hyb_led, &mut hyb_dot, &mut hyb_model, &st.hyb_model, st.hyb_pid);
                     update_ep(&mut ko_led, &mut ko_dot, &mut ko_model, &st.ko_model, st.ko_pid);
+                    update_hrvl(&mut hrvl_led, &mut hrvl_txt, &mut hrvl_dis, &mut hrvl_con, &st);
                     // Start/Stop button state: running = reachable or port held.
                     // gpu/cpu/ko have no on-disk-avail flag → always avail=true.
                     let run = |m: &Option<String>, pid: Option<i64>| m.is_some() || pid.is_some();
@@ -611,6 +631,54 @@ fn side_card(
     });
 
     (led, dot, model, start_btn, stop_btn)
+}
+
+// ── hrvl strip: [LED] "hrvl  UP  main 2x128K  slots 1/2 busy"  [Disconnect] [Reconnect]
+fn hrvl_strip(x: i32, y: i32, s: app::Sender<Msg>, shared: Rc<RefCell<Status>>) -> (Frame, Frame, Button, Button) {
+    let w = W - 24;
+    let mut bg = Frame::new(x, y, w, 50, None);
+    bg.set_frame(FrameType::FlatBox);
+    bg.set_color(Color::from_u32(C_CARD));
+    let mut led = Frame::new(x + 12, y + 17, 16, 16, None);
+    led.set_frame(FrameType::FlatBox);
+    led.set_color(Color::from_u32(C_GRAY));
+    let mut txt = Frame::new(x + 36, y + 14, w - 36 - 240, 22, None);
+    txt.set_label("hrvl  checking");
+    txt.set_label_color(Color::from_u32(C_SUB));
+    txt.set_label_size(14);
+    txt.set_align(Align::Left | Align::Inside);
+    let bw = 108;
+    let dis = btn(x + w - 12 - bw * 2 - 8, y + 10, bw, "Disconnect", C_DOWN, {
+        let s = s; let sh = shared.clone();
+        move |_| {
+            // ponytail: refuse while a slot is busy; `llm hrvl disconnect --force` exists for the terminal
+            if sh.borrow().hrvl_busy > 0 {
+                dialog::message_default("hrvl slot busy — wait until idle (or run: llm hrvl disconnect --force)");
+                return;
+            }
+            run_async(s, vec!["hrvl".into(), "disconnect".into()])
+        }
+    });
+    let con = btn(x + w - 12 - bw, y + 10, bw, "Reconnect", C_OK, {
+        let s = s; move |_| run_async(s, vec!["hrvl".into(), "connect".into()])
+    });
+    (led, txt, dis, con)
+}
+
+fn update_hrvl(led: &mut Frame, txt: &mut Frame, dis: &mut Button, con: &mut Button, st: &Status) {
+    let (color, text) = if !st.hrvl_up {
+        (C_DOWN, format!("hrvl  unreachable{}", if st.hrvl_detached { "  (detached)" } else { "" }))
+    } else if st.hrvl_detached {
+        (C_WARN, format!("hrvl  DETACHED  ({} mode, {}x{}K)", st.hrvl_mode, st.hrvl_np, st.hrvl_ctx / 1024))
+    } else {
+        (C_OK, format!("hrvl  UP  {} {}x{}K  slots {}/{} busy", st.hrvl_mode, st.hrvl_np, st.hrvl_ctx / 1024, st.hrvl_busy, st.hrvl_np))
+    };
+    led.set_color(Color::from_u32(color));
+    txt.set_label(&text);
+    txt.set_label_color(Color::from_u32(color));
+    if st.hrvl_up && !st.hrvl_detached { dis.activate(); } else { dis.deactivate(); }
+    if st.hrvl_detached || !st.hrvl_up { con.activate(); } else { con.deactivate(); }
+    led.redraw(); dis.redraw(); con.redraw();
 }
 
 // ── title-strip widgets (bold, individually colored) ─────────────────
