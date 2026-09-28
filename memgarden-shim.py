@@ -108,6 +108,8 @@ class H(BaseHTTPRequestHandler):
 
     _last_get_log = 0.0
     def do_GET(self):
+        if self.path.startswith("/v1/"):  # e.g. /v1/models from OpenAI-style clients
+            return self._proxy()
         # memgarden probes /api/version every 30 s; log it at most once per 5 min so the journal shows liveness
         now = time.time()
         if now - H._last_get_log > 300:
@@ -125,6 +127,24 @@ class H(BaseHTTPRequestHandler):
             req = json.loads(raw or b"{}")
         except Exception:
             req = {}
+        # OpenAI-style callers (agentmemory: OPENAI_BASE_URL=http://127.0.0.1:11435/v1) — same routing,
+        # body passes through untouched except thinking off + model name on the hrvl side
+        if self.path.startswith("/v1/"):
+            if hrvl_ok() and self.path.startswith("/v1/chat/completions") and not req.get("stream"):
+                if _last_route != "hrvl":
+                    log("route -> hrvl (openai)"); _last_route = "hrvl"
+                    if req.get("model"): unload_local(req["model"])
+                body = dict(req); body["model"] = "local"
+                body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+                t0 = time.time()
+                try:
+                    st, data = http_json(HRVL + self.path, body, timeout=290)
+                    log(f"hrvl openai {time.time()-t0:.1f}s")
+                    return self._send(st, data)
+                except Exception as e:
+                    log("hrvl openai failed, falling back to local ollama:", e)
+                    _route.update(t=time.time(), hrvl=False)
+            return self._proxy(req if req else None)
         use_hrvl = self.path.startswith("/api/generate") and not req.get("stream") and hrvl_ok()
         route = "hrvl" if use_hrvl else "local"
         if route != _last_route:
