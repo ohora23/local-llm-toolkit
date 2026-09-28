@@ -454,11 +454,13 @@ print(len(d), sum(1 for x in d if x.get("is_processing")), d[0].get("n_ctx",0) i
 }
 _hrvl_remote_mode() {  # $1 = main|local ; no-op (with notice) until hrvl-mode is installed on hrvl
   [ -x "$HRVL_SSH" ] || { _info "no ssh helper at $HRVL_SSH — flag updated only"; return 0; }
-  if "$HRVL_SSH" 'test -x ~/local_llm/hrvl-mode' >/dev/null 2>&1; then
-    "$HRVL_SSH" "~/local_llm/hrvl-mode $1"
-  else
-    _info "hrvl-mode not installed on hrvl yet — flag updated only, hrvl keeps its current mode"
-  fi
+  # distinguish "ssh cannot reach hrvl" (return 1 so the login unit retries) from "script missing"
+  local probe; probe=$("$HRVL_SSH" 'test -x ~/local_llm/hrvl-mode && echo yes || echo no' 2>/dev/null | tail -1)
+  case "$probe" in
+    yes) "$HRVL_SSH" "~/local_llm/hrvl-mode $1" ;;
+    no)  _info "hrvl-mode not installed on hrvl — flag updated only, hrvl keeps its current mode" ;;
+    *)   _err "hrvl not reachable over ssh — flag updated, mode not switched (will retry: llm hrvl $([ "$1" = main ] && echo connect || echo disconnect))"; return 1 ;;
+  esac
 }
 cmd_hrvl() {
   case "${1:-status}" in
