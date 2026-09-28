@@ -144,6 +144,9 @@ class H(BaseHTTPRequestHandler):
                     st, data = http_json(HRVL + self.path, body, timeout=290)
                     log(f"hrvl openai {time.time()-t0:.1f}s")
                     return self._send(st, data)
+                except urllib.error.HTTPError as e:
+                    log(f"hrvl openai failed ({e.code}), falling back to local ollama: {e.read()[:300].decode('utf-8','ignore')}")
+                    _route.update(t=time.time(), hrvl=False)
                 except Exception as e:
                     log("hrvl openai failed, falling back to local ollama:", e)
                     _route.update(t=time.time(), hrvl=False)
@@ -163,9 +166,14 @@ class H(BaseHTTPRequestHandler):
             out = from_hrvl(req, json.loads(data), t0)
             log(f"hrvl generate {time.time()-t0:.1f}s prompt={out['prompt_eval_count']} out={out['eval_count']} {out['done_reason']}")
             self._send(200, out)
+        except urllib.error.HTTPError as e:
+            body = e.read()[:300].decode("utf-8", "ignore")
+            log(f"hrvl failed ({e.code}), falling back to local ollama: {body}")
+            _route.update(t=time.time(), hrvl=False)  # avoid re-trying hrvl for the next 5 s
+            self._proxy(req)
         except Exception as e:
             log("hrvl failed, falling back to local ollama:", e)
-            _route.update(t=time.time(), hrvl=False)  # avoid re-trying hrvl for the next 5 s
+            _route.update(t=time.time(), hrvl=False)
             self._proxy(req)
 
 if __name__ == "__main__":
