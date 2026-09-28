@@ -130,10 +130,13 @@ class H(BaseHTTPRequestHandler):
         # OpenAI-style callers (agentmemory: OPENAI_BASE_URL=http://127.0.0.1:11435/v1) — same routing,
         # body passes through untouched except thinking off + model name on the hrvl side
         if self.path.startswith("/v1/"):
-            if hrvl_ok() and self.path.startswith("/v1/chat/completions") and not req.get("stream"):
-                if _last_route != "hrvl":
-                    log("route -> hrvl (openai)"); _last_route = "hrvl"
-                    if req.get("model"): unload_local(req["model"])
+            via_hrvl = hrvl_ok() and self.path.startswith("/v1/chat/completions") and not req.get("stream")
+            route = "hrvl" if via_hrvl else "local"
+            if route != _last_route:  # same bookkeeping as /api/generate: unload the local model on the flip to hrvl
+                log("route ->", route, "(openai)")
+                if route == "hrvl" and req.get("model"): unload_local(req["model"])
+                _last_route = route
+            if via_hrvl:
                 body = dict(req); body["model"] = "local"
                 body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
                 t0 = time.time()
