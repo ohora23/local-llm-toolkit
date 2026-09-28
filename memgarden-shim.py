@@ -106,7 +106,13 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             self._send(502, {"error": f"local ollama unreachable: {e}"})
 
+    _last_get_log = 0.0
     def do_GET(self):
+        # memgarden probes /api/version every 30 s; log it at most once per 5 min so the journal shows liveness
+        now = time.time()
+        if now - H._last_get_log > 300:
+            H._last_get_log = now
+            log("probe", self.path, "->", "hrvl" if hrvl_ok() else "local")
         if self.path.startswith("/api/version") and hrvl_ok():
             return self._send(200, {"version": "0.21.2-hrvl-shim"})
         self._proxy()
