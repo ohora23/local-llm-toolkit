@@ -26,9 +26,15 @@ _last_route = None
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
 
+HOLD_LOCAL_S = 60  # after an hrvl failure stay local this long; 5 s made the route flip-flop and
+                   # unload/reload the local model on every retry (route log 2026-09-28 23:24)
+_hold = {"until": 0.0}
+
 def hrvl_ok():
-    """cached (5 s) attach+health check"""
+    """cached (5 s) attach+health check; pinned to local for HOLD_LOCAL_S after an hrvl failure"""
     now = time.time()
+    if now < _hold["until"]:
+        return False
     if now - _route["t"] < 5:
         return _route["hrvl"]
     ok = False
@@ -64,9 +70,20 @@ def to_hrvl(req):
         msgs.append({"role": "system", "content": req["system"]})
     msgs.append({"role": "user", "content": req.get("prompt", "")})
     body = {"model": "local", "messages": msgs, "stream": False,
+            # Measured 2026-09-29 (same 15-chunk slice, 3 replays): at 0.1 the schema-constrained Qwen3.6
+            # loops on ~25% of first attempts; memgarden's hotter retries recover them (9/9). A 0.3 floor
+            # cut loops to 2/17 but also facts 86 -> 66, so the daemon's own temperature is passed through.
             "temperature": opts.get("temperature", 0.1),
             "max_tokens": int(opts.get("num_predict", 2048)),
+            # Ollama applies repeat_penalty 1.1 by default; llama.cpp's default is 1.0. Without it the
+            # schema-constrained Qwen3.6 fell into "one phrase repeated" loops (memgardend 2026-09-28).
+            "repeat_penalty": opts.get("repeat_penalty", 1.1),
+            # DRY was tried (0.8/1.75/2): loops 5/20 -> 4/20, no real gain, and one "failed to parse
+            # grammar" 400 appeared with it on — left off.
             "chat_template_kwargs": {"enable_thinking": False}}
+    for k in ("top_p", "top_k", "min_p", "seed", "stop"):  # forwarded as-is when memgarden sends them
+        if k in opts:
+            body[k] = opts[k]
     fmt = req.get("format")
     if isinstance(fmt, dict):
         body["response_format"] = {"type": "json_schema", "json_schema": {"name": "memgarden", "schema": fmt}}
@@ -117,6 +134,11 @@ class H(BaseHTTPRequestHandler):
             log("probe", self.path, "->", "hrvl" if hrvl_ok() else "local")
         if self.path.startswith("/api/version") and hrvl_ok():
             return self._send(200, {"version": "0.21.2-hrvl-shim"})
+        if self.path.startswith("/api/ps") and hrvl_ok():
+            # memgarden's GPU prober reads (size, size_vram): vram < size = cpu-only, empty = unknown.
+            # hrvl is a GPU box, so answer with one model fully resident.
+            return self._send(200, {"models": [{"name": "hrvl:Qwen3.6-35B-A3B", "model": "hrvl",
+                                                "size": 1, "size_vram": 1, "details": {}}]})
         self._proxy()
 
     def do_POST(self):
@@ -147,9 +169,11 @@ class H(BaseHTTPRequestHandler):
                 except urllib.error.HTTPError as e:
                     log(f"hrvl openai failed ({e.code}), falling back to local ollama: {e.read()[:300].decode('utf-8','ignore')}")
                     _route.update(t=time.time(), hrvl=False)
+                    _hold["until"] = time.time() + HOLD_LOCAL_S
                 except Exception as e:
                     log("hrvl openai failed, falling back to local ollama:", e)
                     _route.update(t=time.time(), hrvl=False)
+                    _hold["until"] = time.time() + HOLD_LOCAL_S
             return self._proxy(req if req else None)
         use_hrvl = self.path.startswith("/api/generate") and not req.get("stream") and hrvl_ok()
         route = "hrvl" if use_hrvl else "local"
@@ -170,10 +194,12 @@ class H(BaseHTTPRequestHandler):
             body = e.read()[:300].decode("utf-8", "ignore")
             log(f"hrvl failed ({e.code}), falling back to local ollama: {body}")
             _route.update(t=time.time(), hrvl=False)  # avoid re-trying hrvl for the next 5 s
+            _hold["until"] = time.time() + HOLD_LOCAL_S
             self._proxy(req)
         except Exception as e:
             log("hrvl failed, falling back to local ollama:", e)
             _route.update(t=time.time(), hrvl=False)
+            _hold["until"] = time.time() + HOLD_LOCAL_S
             self._proxy(req)
 
 if __name__ == "__main__":
