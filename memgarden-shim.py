@@ -62,6 +62,20 @@ def unload_local(model):
     except Exception as e:
         log("local ollama unload skipped:", e)
 
+MAX_GRAMMAR_STRLEN = 1500  # llama.cpp cannot build a grammar for "maxLength": 2000 ("failed to parse grammar", HTTP 400);
+                           # 1000/1200/1500 parse (measured 2026-09-29). memgarden's consolidation schema uses 2000.
+
+def clamp_schema(node):
+    """copy of a JSON schema with every string maxLength capped at MAX_GRAMMAR_STRLEN"""
+    if isinstance(node, dict):
+        out = {k: clamp_schema(v) for k, v in node.items()}
+        if isinstance(out.get("maxLength"), int) and out["maxLength"] > MAX_GRAMMAR_STRLEN:
+            out["maxLength"] = MAX_GRAMMAR_STRLEN
+        return out
+    if isinstance(node, list):
+        return [clamp_schema(v) for v in node]
+    return node
+
 def to_hrvl(req):
     """Ollama /api/generate body -> OpenAI chat body for llama.cpp"""
     opts = req.get("options") or {}
@@ -86,7 +100,7 @@ def to_hrvl(req):
             body[k] = opts[k]
     fmt = req.get("format")
     if isinstance(fmt, dict):
-        body["response_format"] = {"type": "json_schema", "json_schema": {"name": "memgarden", "schema": fmt}}
+        body["response_format"] = {"type": "json_schema", "json_schema": {"name": "memgarden", "schema": clamp_schema(fmt)}}
     elif fmt == "json":
         body["response_format"] = {"type": "json_object"}
     return body
@@ -160,6 +174,9 @@ class H(BaseHTTPRequestHandler):
                 _last_route = route
             if via_hrvl:
                 body = dict(req); body["model"] = "local"
+                rf = body.get("response_format") or {}
+                if isinstance(rf.get("json_schema"), dict) and "schema" in rf["json_schema"]:
+                    body["response_format"] = {**rf, "json_schema": {**rf["json_schema"], "schema": clamp_schema(rf["json_schema"]["schema"])}}
                 body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
                 t0 = time.time()
                 try:
