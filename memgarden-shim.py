@@ -122,11 +122,18 @@ class H(BaseHTTPRequestHandler):
 
     def _send(self, status, payload):
         data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # The caller hung up (memgardend restarted mid-request). Not an upstream failure:
+            # before 2026-10-14 this raised inside the hrvl try-block, was read as "hrvl failed",
+            # pinned the route to local for HOLD_LOCAL_S and failed two retain chunks on a 5080
+            # that had no room for the local model.
+            log("client gone before the reply was written:", e)
 
     def _proxy(self, body=None):
         try:
@@ -182,7 +189,6 @@ class H(BaseHTTPRequestHandler):
                 try:
                     st, data = http_json(HRVL + self.path, body, timeout=290)
                     log(f"hrvl openai {time.time()-t0:.1f}s")
-                    return self._send(st, data)
                 except urllib.error.HTTPError as e:
                     log(f"hrvl openai failed ({e.code}), falling back to local ollama: {e.read()[:300].decode('utf-8','ignore')}")
                     _route.update(t=time.time(), hrvl=False)
@@ -191,6 +197,8 @@ class H(BaseHTTPRequestHandler):
                     log("hrvl openai failed, falling back to local ollama:", e)
                     _route.update(t=time.time(), hrvl=False)
                     _hold["until"] = time.time() + HOLD_LOCAL_S
+                else:
+                    return self._send(st, data)  # outside the try: a client hang-up is not an hrvl failure
             return self._proxy(req if req else None)
         use_hrvl = self.path.startswith("/api/generate") and not req.get("stream") and hrvl_ok()
         route = "hrvl" if use_hrvl else "local"
@@ -206,7 +214,6 @@ class H(BaseHTTPRequestHandler):
             st, data = http_json(HRVL + "/v1/chat/completions", to_hrvl(req), timeout=290)
             out = from_hrvl(req, json.loads(data), t0)
             log(f"hrvl generate {time.time()-t0:.1f}s prompt={out['prompt_eval_count']} out={out['eval_count']} {out['done_reason']}")
-            self._send(200, out)
         except urllib.error.HTTPError as e:
             body = e.read()[:300].decode("utf-8", "ignore")
             log(f"hrvl failed ({e.code}), falling back to local ollama: {body}")
@@ -218,6 +225,8 @@ class H(BaseHTTPRequestHandler):
             _route.update(t=time.time(), hrvl=False)
             _hold["until"] = time.time() + HOLD_LOCAL_S
             self._proxy(req)
+        else:
+            self._send(200, out)  # outside the try: a client hang-up is not an hrvl failure
 
 if __name__ == "__main__":
     log(f"memgarden-shim on 127.0.0.1:{PORT}  hrvl={HRVL}  ollama={OLLAMA}")
