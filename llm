@@ -24,6 +24,7 @@
 #    llm status                       engines/ports/models/VRAM/RAM/CPU at a glance
 #    llm models                       /v1/models of all endpoints
 #    llm ask "prompt" [--cpu|--gpu|--hyb|--ko|--hrvl|--hermes] [--fast]   one-shot (default: whatever is up)
+#        stdin that is not a tty (cat f | llm ask ...) is appended to the prompt; --hrvl calls are logged to ~/.local/state/llm/oc-runs.jsonl
 #        --fast = thinking OFF (chat_template_kwargs enable_thinking:false) — 요약/번역/분류 등 단발 텍스트용, 7.8s→1.0s
 #    llm chat [--cpu|--gpu|--hyb|--ko]   interactive chat REPL
 #    llm switch <a-moe|a-moe-q8|b-light>   switch CPU profile (restart if running)
@@ -351,7 +352,20 @@ cmd_ask() {
   for a in "$@"; do
     case "$a" in --cpu) tgt=cpu;; --gpu) tgt=gpu;; --hyb) tgt=hyb;; --ko) tgt=ko;; --hrvl) tgt=hrvl;; --hermes) tgt=hermes;; --fast) fast=1;; *) prompt="$a";; esac
   done
+  # piped input (cat f | llm ask "...") is appended to the prompt; stdin is /dev/null from Claude's Bash tool, so no wait
+  if [ ! -t 0 ]; then local piped; piped=$(cat); [ -n "$piped" ] && prompt="$prompt"$'\n\n'"$piped"; fi
   [ -n "$prompt" ] || { _err 'llm ask "prompt" [--cpu|--gpu|--hyb|--ko|--hrvl|--hermes] [--fast]'; return 1; }
+  local t0 rc; t0=$(date +%s)
+  _ask_send "$tgt" "$prompt" "$fast"; rc=$?
+  [ "$tgt" = hrvl ] && RC=$rc SECS=$(( $(date +%s) - t0 )) CHARS=${#prompt} python3 -c '
+import os, json, datetime
+e = os.environ
+print(json.dumps({"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "kind": "ask",
+  "prompt_chars": int(e["CHARS"]), "secs": int(e["SECS"]), "rc": int(e["RC"])}))' >>"$STATE_DIR/oc-runs.jsonl"
+  return "$rc"
+}
+_ask_send() {  # <tgt> <prompt> <fast>: stream one answer; exit 3 = hrvl detached, 1 = endpoint down / request failed
+  local tgt="$1" prompt="$2" fast="$3" host port
   [ "$tgt" = hrvl ] && [ -f "$HRVL_DETACHED" ] && { _err "hrvl is detached from this PC (llm hrvl connect to re-attach) — do it locally"; return 3; }
   read -r host port < <(_target "$tgt")
   _reachable "$host" "$port" || { _err "$tgt endpoint not up ($host:$port). First: llm up $tgt (remote: check its own service)"; return 1; }
